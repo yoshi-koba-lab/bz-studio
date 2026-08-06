@@ -1037,11 +1037,8 @@ class MainWindow(QMainWindow):
         b4 = QPushButton("Export Plate to PDF")
         b4.setToolTip("All wells arranged as a contact sheet in one PDF (quality selectable)")
         b4.clicked.connect(self._export_plate_pdf)
-        b5 = QPushButton("Stitch Raw Tiles…")
-        b5.setToolTip("Rebuild whole-well mosaics from the raw tiles "
-                      "(no vendor software needed)")
-        b5.clicked.connect(self._stitch_raw_tiles)
-        for b in (b1, b2, b3, b4, b5):
+        # Stitching belongs to the raw workflow only — it lives in the raw panel.
+        for b in (b1, b2, b3, b4):
             eg.addWidget(b)
         eg.addStretch()
         bl.addWidget(export_group)
