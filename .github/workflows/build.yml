@@ -1,0 +1,67 @@
+name: Build standalone apps
+
+# Build macOS (.app) and Windows (folder) bundles.
+# - On a version tag (v1.0.0, ...) the zips are attached to a GitHub Release.
+# - Manual runs (workflow_dispatch) upload them as workflow artifacts you can download.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create/attach releases
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest runners are Apple Silicon; a build made there will not run on
+          # Intel Macs, so build both. macos-13 is the last x86_64 runner image.
+          - os: macos-latest
+            artifact: KTF-Viewer-macOS-appleSilicon
+            bundle: "dist/KTF Viewer.app"
+          - os: macos-13
+            artifact: KTF-Viewer-macOS-intel
+            bundle: "dist/KTF Viewer.app"
+          - os: windows-latest
+            artifact: KTF-Viewer-Windows
+            bundle: "dist/KTF Viewer"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm ktf_viewer.spec
+
+      - name: Zip bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -ry "../${{ matrix.artifact }}.zip" "KTF Viewer.app"
+
+      - name: Zip bundle (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path "dist/KTF Viewer/*" -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+      - name: Attach to Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.zip

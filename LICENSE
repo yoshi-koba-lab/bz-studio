@@ -1,0 +1,106 @@
+Copyright (c) 2026 yoshi-koba-lab. All Rights Reserved.
+
+---
+
+## 日本語（正文）
+
+本ソフトウェア（ソースコード、ビルド成果物、付随するドキュメントを含む。以下
+「本ソフトウェア」）の著作権は著作権者に帰属します。
+
+### 許可される利用
+
+以下は、著作権者への事前の連絡なく自由に行えます。
+
+1. 本ソフトウェアを閲覧すること。
+2. 自身の管理する計算機上で本ソフトウェアを実行すること。
+3. 研究目的で本ソフトウェアを利用すること（本ソフトウェアを用いて得た画像・
+   測定値・解析結果を、論文・学会発表・学位論文等で使用することを含みます）。
+4. 上記の目的のために、自身の利用範囲でソースコードを改変すること。
+
+### 禁止される行為
+
+以下は、著作権者による書面（電子メールを含む）での事前許可なく行うことを
+禁止します。
+
+1. 再配布。本ソフトウェアの全部または一部を、第三者に配布・提供・販売する
+   こと。
+2. ミラーリング。本ソフトウェアの複製を、別のリポジトリ・アーカイブ・配布
+   サイト等に公開すること。
+3. 派生物の公開。本ソフトウェアを改変したもの、または本ソフトウェアの実質的
+   部分を含むものを公開すること。
+4. 第三者ホスティング。本ソフトウェアを、第三者が利用できる形でサービスとして
+   提供すること。
+
+上記 3 の「実質的部分」には、本ソフトウェアのソースコードの相当部分を取り込ん
+だ別プロジェクトを含みます。
+
+### 第三者のソフトウェア
+
+本ソフトウェアは、それぞれの提供者のライセンス条件に従う第三者ソフトウェアを
+利用または同梱しています。本ライセンスは、それら第三者ソフトウェアに対する
+権利には影響しません。主なものは以下のとおりです。
+
+- PyQt6 / Qt — GPL または Qt 社の商用ライセンス
+- NumPy, Pillow, tifffile — 各パッケージの BSD 系ライセンス
+- PyInstaller（ビルド時） — 提供元の条件による
+
+### ファイル形式について
+
+本ソフトウェアは、Keyence BZ-X が出力するファイルを読み取るために、公開されて
+いない `.ktf` 形式を解析した実装を含みます。これは、利用者自身が取得したデータ
+に自身でアクセスするための相互運用を目的とした独立実装であり、株式会社キーエンス
+のソフトウェアのコード・解析・改変によるものではありません。本ソフトウェアは
+株式会社キーエンスとは無関係であり、同社による承認・支援を受けていません。
+「KEYENCE」「BZ-X」は各権利者の商標です。
+
+### 無保証および免責
+
+本ソフトウェアは「現状有姿」で提供されます。著作権者は、商品性、特定目的への
+適合性、および権利非侵害を含むいかなる保証も行いません。本ソフトウェアの使用
+または使用不能から生じるいかなる損害についても、著作権者は責任を負いません。
+
+本ソフトウェアは研究用のツールであり、診断その他の医療目的で使用されることを
+意図していません。
+
+### お問い合わせ
+
+上記の禁止行為に関する許可のご相談は、GitHub リポジトリの Issue、または著作権者
+へ直接ご連絡ください。
+
+---
+
+## English (reference translation)
+
+The Japanese text above is the governing version. This translation is provided
+for convenience only; in case of any discrepancy, the Japanese text prevails.
+
+Copyright in this software (source code, build artifacts, and accompanying
+documentation; the "Software") is retained by the copyright holder.
+
+**Permitted without prior contact:** viewing the Software; running it on
+machines you control; using it for research purposes, including the use of
+images, measurements, and analyses produced with it in papers, presentations,
+and theses; and modifying the source for your own such use.
+
+**Prohibited without the copyright holder's prior written permission** (email is
+acceptable): redistribution of the Software in whole or in part; mirroring it to
+another repository, archive, or distribution site; publishing derivative works or
+anything containing a substantial part of the Software; and hosting it as a
+service available to third parties.
+
+**Third-party software** used by the Software (PyQt6/Qt, NumPy, Pillow,
+tifffile, PyInstaller) remains under its own license; this license does not
+affect those rights.
+
+**File format.** The Software includes an independent implementation that reads
+the undocumented `.ktf` format written by the Keyence BZ-X, for the sole purpose
+of letting users open their own data. It is not derived from, and does not
+involve analysis or modification of, KEYENCE CORPORATION's software. This
+project is not affiliated with, endorsed by, or supported by KEYENCE
+CORPORATION; "KEYENCE" and "BZ-X" are trademarks of their respective owners.
+
+**No warranty.** The Software is provided "AS IS", without warranty of any kind,
+express or implied, including merchantability, fitness for a particular purpose,
+and non-infringement. The copyright holder is not liable for any damages arising
+from use of or inability to use the Software. This is a research tool and is not
+intended for diagnostic or other medical use.

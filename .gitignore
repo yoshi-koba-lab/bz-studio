@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# App runtime
+*.log
+
+# Local test data (do not commit microscope data)
+sample_data/*.ktf
+scratchpad/
+synthetic/
+
+# Exported results — the app's save dialogs default to the working directory, so
+# real experiment output easily lands here. Never publish it.
+*.ktf
+*.tif
+*.tiff
+*.pdf
+*.png
+*.jpg
+*_conditions.csv
+!docs/**/*.png

@@ -1,0 +1,5 @@
+PyQt6>=6.5
+numpy>=1.24
+Pillow>=10.0
+tifffile>=2023.7          # OME-TIFF output for stitched mosaics
+imagecodecs>=2024.1       # optional: enables zlib-compressed TIFF (LZW used otherwise)

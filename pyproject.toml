@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ktf-viewer"
+version = "1.0.0"
+description = "Cross-platform viewer for Keyence BZ-X (.ktf) stitched microscope images"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary — All Rights Reserved" }
+authors = [{ name = "Yoshi Kobayashi" }]
+keywords = ["keyence", "bz-x", "ktf", "microscopy", "image-viewer", "bioimaging"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "PyQt6>=6.5",
+    "numpy>=1.24",
+    "Pillow>=10.0",
+    "tifffile>=2023.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/yoshi-koba-lab/ktf-viewer"
+Issues = "https://github.com/yoshi-koba-lab/ktf-viewer/issues"
+
+[project.gui-scripts]
+ktf-viewer = "main:main"
+
+[tool.setuptools]
+py-modules = ["main", "ktf_reader", "render", "stitcher", "version"]
