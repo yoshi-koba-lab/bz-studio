@@ -902,6 +902,9 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._setup_toolbar()
         self._apply_style()
+        self._update_checker = None
+        if QSettings().value("check_updates", "1") == "1":
+            QTimer.singleShot(2500, lambda: self._check_updates(quiet=True))
 
     # ---------- UI ----------
     def _setup_ui(self):
@@ -1082,6 +1085,16 @@ class MainWindow(QMainWindow):
         a = QAction("Quit", self); a.setShortcut(QKeySequence("Ctrl+Q"))
         a.triggered.connect(self.close); fm.addAction(a)
         hm = menu.addMenu("Help")
+        a = QAction("アップデートを確認…", self)
+        a.triggered.connect(lambda: self._check_updates(quiet=False))
+        hm.addAction(a)
+        a = QAction("起動時にアップデートを確認", self)
+        a.setCheckable(True)
+        a.setChecked(QSettings().value("check_updates", "1") == "1")
+        a.toggled.connect(
+            lambda on: QSettings().setValue("check_updates", "1" if on else "0"))
+        hm.addAction(a)
+        hm.addSeparator()
         a = QAction(f"About {APP_NAME}", self)
         a.triggered.connect(self._about)
         hm.addAction(a)
@@ -1108,14 +1121,50 @@ class MainWindow(QMainWindow):
             act.triggered.connect(slot)
             tb.addAction(act)
 
+    def _check_updates(self, quiet=True):
+        """Ask GitHub whether a newer release exists.
+
+        Quiet at startup — it only speaks up when there IS an update, so being
+        offline or rate-limited is silent. The Help menu runs it loudly.
+        """
+        if self._update_checker and self._update_checker.isRunning():
+            return
+        self._update_checker = UpdateChecker()
+        self._update_checker.found.connect(self._on_update_found)
+        if not quiet:
+            self.statusBar().showMessage("アップデートを確認しています…")
+            self._update_checker.finished.connect(self._on_check_finished)
+        self._update_checker.start()
+
+    def _on_check_finished(self):
+        if not getattr(self, "_update_seen", False):
+            self.statusBar().showMessage(
+                f"最新版を使用しています（{__version__}）")
+        self._update_seen = False
+
+    def _on_update_found(self, version, url):
+        self._update_seen = True
+        self.statusBar().showMessage(f"新しいバージョン {version} が利用できます")
+        box = QMessageBox(self)
+        box.setStyleSheet("")
+        box.setWindowTitle("アップデートがあります")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(f"{APP_NAME} <b>{version}</b> が公開されています"
+                    f"（現在 {__version__}）。")
+        go = box.addButton("ダウンロードページを開く", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("あとで", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is go and url:
+            QDesktopServices.openUrl(QUrl(url))
+
     def _about(self):
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
-            "BZ-X (.ktf) viewer and tile stitcher.<br>"
+            "BZ-X 画像のウェルプレートビューア／タイル貼り合わせ<br>"
             "&copy; 2026 yoshi-koba-lab — All Rights Reserved.<br><br>"
-            "<a href='https://github.com/yoshi-koba-lab/ktf-viewer'>"
-            "github.com/yoshi-koba-lab/ktf-viewer</a>")
+            "<a href='https://github.com/yoshi-koba-lab/bz-plate-studio'>"
+            "github.com/yoshi-koba-lab/bz-plate-studio</a>")
 
     def _apply_style(self):
         self.setStyleSheet("""
@@ -2357,6 +2406,48 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"PDF export failed: {e}")
 
 
+REPO = "yoshi-koba-lab/bz-plate-studio"
+
+
+def _newer(remote: str, local: str) -> bool:
+    """True when `remote` is a later semantic version than `local`."""
+    def parts(v):
+        v = v.strip().lstrip("vV").split("+")[0].split("-")[0]
+        out = []
+        for x in v.split("."):
+            try:
+                out.append(int(x))
+            except ValueError:
+                out.append(0)
+        return tuple(out + [0, 0, 0])[:3]
+    try:
+        return parts(remote) > parts(local)
+    except Exception:
+        return False
+
+
+class UpdateChecker(QThread):
+    """Asks GitHub for the newest release. Silent on any failure."""
+
+    found = pyqtSignal(str, str)     # version, html_url
+
+    def run(self):
+        import json as _json
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{REPO}/releases/latest",
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": f"{APP_NAME}/{__version__}"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = _json.loads(r.read().decode("utf-8"))
+            tag = (data.get("tag_name") or "").strip()
+            if tag and _newer(tag, __version__):
+                self.found.emit(tag.lstrip("vV"), data.get("html_url") or "")
+        except Exception:
+            pass          # offline, rate-limited, no release yet — never bother the user
+
+
 class StartModeDialog(QDialog):
     """Which of the two workflows to start in.
 
@@ -3000,7 +3091,7 @@ def main():
     # Automated runs must never write into the real user settings — a test that
     # fills the Conditions table would otherwise persist against a real experiment.
     app.setApplicationName(
-        APP_NAME + " (test)" if os.environ.get("KTF_VIEWER_TEST") else APP_NAME)
+        APP_NAME + " (test)" if os.environ.get("BZPS_TEST") else APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle(LeftAffirmativeStyle())   # Yes/OK on the left
     _install_excepthook()

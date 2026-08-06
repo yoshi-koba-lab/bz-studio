@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ktf-viewer"
-version = "1.4.0"
-description = "Cross-platform viewer and stitcher for BZ-X (.ktf) microscope images"
+name = "bz-plate-studio"
+version = "1.4.1"
+description = "Well-plate viewer and tile stitcher for BZ-X microscope images"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Proprietary — All Rights Reserved" }
@@ -27,11 +27,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yoshi-koba-lab/ktf-viewer"
-Issues = "https://github.com/yoshi-koba-lab/ktf-viewer/issues"
+Homepage = "https://github.com/yoshi-koba-lab/bz-plate-studio"
+Issues = "https://github.com/yoshi-koba-lab/bz-plate-studio/issues"
 
 [project.gui-scripts]
-ktf-viewer = "main:main"
+bz-plate-studio = "main:main"
 
 [tool.setuptools]
 py-modules = ["main", "ktf_reader", "render", "stitcher", "version"]

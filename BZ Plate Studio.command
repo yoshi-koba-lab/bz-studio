@@ -1,5 +1,5 @@
 #!/bin/bash
-# Double-click this file in Finder to launch KTF Viewer.
+# Double-click this file in Finder to launch BZ Plate Studio.
 # (First time: right-click → Open, to get past macOS Gatekeeper.)
 cd "$(dirname "$0")" || exit 1
 

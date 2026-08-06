@@ -4,7 +4,7 @@
 import os
 import sys
 
-APP_NAME = "KTF Viewer"
+APP_NAME = "BZ Plate Studio"
 _ICON = "app_icon.icns" if sys.platform == "darwin" else "app_icon.ico"
 ICON = _ICON if os.path.exists(_ICON) else None  # optional; add later for a custom icon
 
@@ -59,6 +59,6 @@ if sys.platform == "darwin":
         bundle_identifier="io.github.ktf-viewer",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "1.4.0",
+            "CFBundleShortVersionString": "1.4.1",
         },
     )

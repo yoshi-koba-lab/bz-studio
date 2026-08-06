@@ -1,8 +1,10 @@
-# KTF Viewer
+# BZ Plate Studio
 
-BZ-X シリーズの蛍光顕微鏡が出力する `.ktf`（貼り合わせ済みモザイク）を
-Mac / Windows で開くビューアです。メーカー純正ソフトも USB ドングルも要りません。
-生タイルからの貼り合わせ（スティッチング）も自前で行えます。
+BZ-X シリーズの蛍光顕微鏡で撮影したウェルプレート画像を Mac / Windows で扱う
+ソフトウェアです。メーカー純正ソフトも USB ドングルも要りません。
+
+- **`.ktf`（貼り合わせ済みモザイク）を開いて表示・書き出す**
+- **生の各視野タイルから自前で貼り合わせる（スティッチング）**
 
 > 装置メーカーとは無関係の、有志による独立したプロジェクトです。利用者が自分で
 > 取得したデータを自分で開くための相互運用を目的としています。本文中の製品名は
@@ -33,12 +35,12 @@ Mac / Windows で開くビューアです。メーカー純正ソフトも USB �
 
 [Releases](../../releases) から自分の環境に合うものを取得してください。
 
-- **macOS** — `KTF-Viewer-macOS-appleSilicon.zip`（M1/M2/M3…）または
-  `KTF-Viewer-macOS-intel.zip`。展開して `KTF Viewer.app` を Applications へ。
+- **macOS** — `BZ-Plate-Studio-macOS-appleSilicon.zip`（M1/M2/M3…）または
+  `BZ-Plate-Studio-macOS-intel.zip`。展開して `BZ Plate Studio.app` を Applications へ。
   初回のみ **右クリック → 開く**（署名していないため Gatekeeper が一度警告します）。
   それでも開けない場合はターミナルで一度だけ:
-  `xattr -cr "/Applications/KTF Viewer.app"`
-- **Windows** — `KTF-Viewer-Windows.zip` を展開して `KTF Viewer.exe`。
+  `xattr -cr "/Applications/BZ Plate Studio.app"`
+- **Windows** — `BZ-Plate-Studio-Windows.zip` を展開して `BZ Plate Studio.exe`。
   SmartScreen が出たら「詳細情報 → 実行」。
 
 ### 方法 B: ソースから（Python 3.9 以上）
@@ -141,7 +143,14 @@ pyinstaller --noconfirm ktf_viewer.spec
 
 `version.py` の `__version__` が唯一の正です。セマンティックバージョニング
 （MAJOR.MINOR.PATCH）で、MAJOR は出力形式や `.ktf` の読み取りに互換性のない変更、
-MINOR は後方互換のある機能追加、PATCH は修正のみ。現在 **1.4.0**。
+**通常の更新は末尾（PATCH）を上げます** — 修正も小さな改善もここです。MINOR は
+まとまった新機能、MAJOR は出力形式や `.ktf` の読み取りに互換性のない変更のときだけ。
+現在 **1.4.1**。
+
+**アップデート通知** — 起動時に GitHub の最新リリースを確認し、新しい版があるときだけ
+知らせます（オフラインや確認失敗のときは何も表示しません）。**Help ▸ アップデートを
+確認…** でいつでも手動確認でき、**Help ▸ 起動時にアップデートを確認** で自動確認を
+オフにできます。
 
 ## ライセンス
 

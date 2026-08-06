@@ -21,14 +21,14 @@ jobs:
           # on Intel Macs, so build both. macos-13 was retired, so Intel builds use
           # macos-15-intel.
           - os: macos-latest
-            artifact: KTF-Viewer-macOS-appleSilicon
-            bundle: "dist/KTF Viewer.app"
+            artifact: BZ-Plate-Studio-macOS-appleSilicon
+            bundle: "dist/BZ Plate Studio.app"
           - os: macos-15-intel
-            artifact: KTF-Viewer-macOS-intel
-            bundle: "dist/KTF Viewer.app"
+            artifact: BZ-Plate-Studio-macOS-intel
+            bundle: "dist/BZ Plate Studio.app"
           - os: windows-latest
-            artifact: KTF-Viewer-Windows
-            bundle: "dist/KTF Viewer"
+            artifact: BZ-Plate-Studio-Windows
+            bundle: "dist/BZ Plate Studio"
     runs-on: ${{ matrix.os }}
     # A retired runner label queues forever instead of failing; cap it so a bad
     # label is visible in minutes rather than blocking the release.
@@ -52,11 +52,11 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -ry "../${{ matrix.artifact }}.zip" "KTF Viewer.app"
+          zip -ry "../${{ matrix.artifact }}.zip" "BZ Plate Studio.app"
 
       - name: Zip bundle (Windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path "dist/KTF Viewer/*" -DestinationPath "${{ matrix.artifact }}.zip"
+        run: Compress-Archive -Path "dist/BZ Plate Studio/*" -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
