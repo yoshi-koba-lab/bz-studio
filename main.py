@@ -2581,6 +2581,7 @@ class StitchDialog(QDialog):
             "Separate TIFF per channel",
             "PDF (1 well per page)",
             "PDF contact sheet (all wells on one page)",
+            "PDF: contact sheet + one well per page",
             "OME-TIFF + PDF contact sheet",
         ])
         form.addWidget(self.cmb_fmt, r, 1); r += 1
@@ -2623,7 +2624,8 @@ class StitchDialog(QDialog):
     @property
     def fmt(self):
         return ["both", "ometiff", "png", "split",
-                "pdf_pages", "pdf_sheet", "ometiff_pdf"][self.cmb_fmt.currentIndex()]
+                "pdf_pages", "pdf_sheet", "pdf_sheet_pages",
+                "ometiff_pdf"][self.cmb_fmt.currentIndex()]
 
     @property
     def flatfield(self):
@@ -2646,6 +2648,7 @@ class StitchWorker(QThread):
         self._cond = conditions or {}
         self._cond_headers = cond_headers or []
         self.sheet_panels = {}
+        self.well_pages = []
         self.wells = wells
         self.out_dir = Path(out_dir)
         self.z_mode = z_mode
@@ -2736,7 +2739,8 @@ class StitchWorker(QThread):
                 self.warnings.append(f"{wid}: {_friendly_error(e)}")
                 failed += 1
 
-        if self.fmt in ("pdf_sheet", "ometiff_pdf") and self.sheet_panels and not self._cancel:
+        if self.fmt in ("pdf_sheet", "pdf_sheet_pages", "ometiff_pdf") \
+                and self.sheet_panels and not self._cancel:
             self.progress.emit("コンタクトシート PDF を作成中…", -1.0)
             try:
                 self._write_contact_sheet()
@@ -2834,7 +2838,10 @@ class StitchWorker(QThread):
         if self.fmt == "pdf_pages":
             im = self._composite(planes_data)
             self._label_and_save_pdf(im, wid, self.out_dir / f"{wid}.pdf")
-        if self.fmt in ("pdf_sheet", "ometiff_pdf"):
+        if self.fmt == "pdf_sheet_pages":
+            # a page per well, appended after the overview sheet in ONE document
+            self.well_pages.append((wid, self._page_for(self._composite(planes_data), wid)))
+        if self.fmt in ("pdf_sheet", "pdf_sheet_pages", "ometiff_pdf"):
             # keep a downscaled panel; the full sheet is written once at the end
             im = self._composite(planes_data)
             im.thumbnail((self.SHEET_PANEL, self.SHEET_PANEL), Image.Resampling.LANCZOS)
@@ -2845,6 +2852,13 @@ class StitchWorker(QThread):
 
     def _label_and_save_pdf(self, im, wid, path):
         """One well per page, with its conditions printed on the image."""
+        page = self._page_for(im, wid)
+        tmp = Path(str(path) + ".part")
+        page.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0)
+        tmp.replace(path)
+
+    def _page_for(self, im, wid):
+        """A single well rendered as a labelled page."""
         band = max(48, im.height // 24)
         page = Image.new("RGB", (im.width, im.height + band), (255, 255, 255))
         page.paste(im.convert("RGB"), (0, band))
@@ -2858,9 +2872,7 @@ class StitchWorker(QThread):
                                  _load_font_static(max(22, band // 2)),
                                  _load_font_static(max(16, band // 3)), 12,
                                  page.width - 32)
-        tmp = Path(str(path) + ".part")
-        page.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0)
-        tmp.replace(path)
+        return page
 
     def _write_contact_sheet(self):
         """All wells on one page, in plate layout, with their conditions."""
@@ -2899,10 +2911,15 @@ class StitchWorker(QThread):
                 _draw_caption_static(sheet, d, x0 + int(6 * k), y0 + int(6 * k), wid,
                                      self.conditions_for(wid), f_lbl, f_cond,
                                      max(4, int(6 * k)), cw - int(12 * k))
-        path = self.out_dir / f"{self.exp_name}_plate.pdf"
+        extra = [pg for _, pg in self.well_pages]
+        name = (f"{self.exp_name}_plate_and_wells.pdf" if extra
+                else f"{self.exp_name}_plate.pdf")
+        path = self.out_dir / name
         tmp = Path(str(path) + ".part")
-        sheet.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0)
+        sheet.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0,
+                   save_all=bool(extra), append_images=extra)
         tmp.replace(path)
+        self.well_pages.clear()
 
 
 class LeftAffirmativeStyle(QProxyStyle):
