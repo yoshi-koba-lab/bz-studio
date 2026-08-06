@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ktf-viewer"
 version = "1.0.0"
-description = "Cross-platform viewer for Keyence BZ-X (.ktf) stitched microscope images"
+description = "Cross-platform viewer and stitcher for BZ-X (.ktf) microscope images"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Proprietary — All Rights Reserved" }
 authors = [{ name = "Yoshi Kobayashi" }]
-keywords = ["keyence", "bz-x", "ktf", "microscopy", "image-viewer", "bioimaging"]
+keywords = ["bz-x", "ktf", "microscopy", "image-viewer", "stitching", "bioimaging"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: Other/Proprietary License",

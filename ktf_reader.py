@@ -1,5 +1,5 @@
 """
-Keyence KTL2/BZ03 .ktf file reader — memory-efficient version.
+KTL2/BZ03 .ktf file reader — memory-efficient version.
 
 Uses mmap for file access and supports downsampled reading to handle
 files up to 500MB+ without excessive memory usage.
@@ -18,8 +18,8 @@ from typing import Optional
 import numpy as np
 
 
-def decode_keyence_double(raw: str) -> float:
-    """Keyence stores System.Double values as their int64 bit pattern in XML.
+def decode_packed_double(raw: str) -> float:
+    """The format stores System.Double values as their int64 bit pattern in XML.
 
     e.g. calibration "4656510908468559872" -> 2000.0 (nm/pixel).
     """
@@ -186,7 +186,7 @@ def _parse_xml_from_file(f, footer_offset: int, num_entries: int) -> KtfMetadata
                 meta.patch_count = int(pc.text)
             cal = img.find("Calibration")
             if cal is not None and cal.text:
-                meta.calibration_nm = decode_keyence_double(cal.text)
+                meta.calibration_nm = decode_packed_double(cal.text)
         lens = sfp.find("Lens")
         if lens is not None:
             ln = lens.find("LensName")
@@ -197,10 +197,10 @@ def _parse_xml_from_file(f, footer_offset: int, num_entries: int) -> KtfMetadata
                 meta.magnification = int(mg.text)
             na = lens.find("NumericalAperture")
             if na is not None and na.text:
-                meta.numerical_aperture = decode_keyence_double(na.text)
+                meta.numerical_aperture = decode_packed_double(na.text)
             wd = lens.find("WorkingDistance")
             if wd is not None and wd.text:
-                meta.working_distance_mm = decode_keyence_double(wd.text)
+                meta.working_distance_mm = decode_packed_double(wd.text)
         shoot = sfp.find("Shooting")
         if shoot is not None:
             for tag, attr in [("Channel", "channel"), ("ChannelComment", "channel_comment"),
@@ -426,7 +426,7 @@ def is_ktf_file(p: Path) -> bool:
 
 
 def scan_experiment_folder(folder: Path) -> dict:
-    """Scan a Keyence experiment folder and return organized structure.
+    """Scan an experiment folder and return organized structure.
 
     Unreadable/corrupt .ktf files are skipped and reported in result["errors"]
     rather than aborting the whole scan.

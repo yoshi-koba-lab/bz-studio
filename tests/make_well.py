@@ -5,7 +5,7 @@ Parameters match what was measured on the real instrument:
   a 5x5 grid with the corners missing (21 tiles), strong vignetting
   (a uniform specimen reads 47-152 for a true value of 120).
 Because the scene, the lattice and the shading are known exactly, geometry and
-intensity can both be scored against truth rather than against Keyence's output.
+intensity can both be scored against truth rather than against vendor output.
 """
 from __future__ import annotations
 

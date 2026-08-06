@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keyence KTF Viewer — Mac desktop app for viewing .ktf microscope images.
+"""KTF Viewer — desktop app for viewing .ktf microscope images.
 
 Features: well-plate browser, multi-channel pseudocolor compositing, full-resolution
 detail-on-zoom, real-world scale bar, cursor readout (stage position + intensity),
@@ -251,7 +251,7 @@ class ImageCanvas(QWidget):
             p.setPen(QColor(110, 110, 110))
             p.setFont(QFont("Menlo", 13))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                       "Open a Keyence folder, then click a well\n\n"
+                       "Open an experiment folder, then click a well\n\n"
                        "scroll = zoom   ·   drag = pan   ·   ⌘0 = fit")
             p.end()
             return
@@ -975,8 +975,8 @@ class MainWindow(QMainWindow):
         b4.setToolTip("All wells arranged as a contact sheet in one PDF (quality selectable)")
         b4.clicked.connect(self._export_plate_pdf)
         b5 = QPushButton("Stitch Raw Tiles…")
-        b5.setToolTip("Rebuild whole-well mosaics from the raw BZ-X tiles "
-                      "(no Keyence Analyzer needed)")
+        b5.setToolTip("Rebuild whole-well mosaics from the raw tiles "
+                      "(no vendor software needed)")
         b5.clicked.connect(self._stitch_raw_tiles)
         for b in (b1, b2, b3, b4, b5):
             eg.addWidget(b)
@@ -987,7 +987,7 @@ class MainWindow(QMainWindow):
         rl.addWidget(bottom, stretch=0)
         splitter.addWidget(right)
         splitter.setSizes([380, 1120])
-        self.statusBar().showMessage("Open a Keyence experiment folder to begin")
+        self.statusBar().showMessage("Open an experiment folder to begin")
 
     def _setup_menu(self):
         menu = self.menuBar()
@@ -1029,7 +1029,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
-            "Keyence BZ-X (.ktf) viewer and tile stitcher.<br>"
+            "BZ-X (.ktf) viewer and tile stitcher.<br>"
             "&copy; 2026 yoshi-koba-lab — All Rights Reserved.<br><br>"
             "<a href='https://github.com/yoshi-koba-lab/ktf-viewer'>"
             "github.com/yoshi-koba-lab/ktf-viewer</a>")
@@ -1061,7 +1061,7 @@ class MainWindow(QMainWindow):
             self._open_path(Path(f))
 
     # kept for the menu alias; behaves identically now (smart, level-agnostic)
-    def _open_keyence_hdd(self):
+    def _open_data_root(self):
         self._open_folder()
 
     @staticmethod
@@ -1590,7 +1590,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "No raw tiles",
                 f"No per-field tiles (X###Y### folders) were found under\n“{exp_dir.name}”.\n\n"
-                "Stitching needs the original capture folders the BZ-X wrote.")
+                "Stitching needs the original per-field capture folders.")
             return
 
         dlg = StitchDialog(wells, self)

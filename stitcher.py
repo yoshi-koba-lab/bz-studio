@@ -1,8 +1,8 @@
-"""Stitch Keyence BZ-X raw tiles into whole-well mosaics.
+"""Stitch BZ-X raw tiles into whole-well mosaics.
 
-The BZ-X writes every field of view as a standard OME-TIFF under
+The instrument writes every field of view as a standard OME-TIFF under
 ``<experiment>/<well>/X###Y###/``.  This module reassembles them without the
-Keyence Analyzer:
+vendor's analysis software:
 
   * tile offsets are recovered from the images themselves (phase correlation on
     the overlapping strips), so no proprietary metadata is needed;

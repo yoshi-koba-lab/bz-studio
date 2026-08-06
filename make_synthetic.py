@@ -1,4 +1,4 @@
-"""Generate a synthetic KTL2/.ktf file matching the real Keyence format,
+"""Generate a synthetic KTL2/.ktf file matching the real format,
 for headless testing when the HDD is disconnected."""
 import struct
 import io
@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 
 
-def encode_keyence_double(val: float) -> int:
+def encode_packed_double(val: float) -> int:
     return struct.unpack("<q", struct.pack("<d", val))[0]
 
 
@@ -55,9 +55,9 @@ def make_ktf(path, width, height, planes=1, calibration_nm=2000.0,
     data.write(jbuf.getvalue())
 
     # XML metadata
-    cal = encode_keyence_double(calibration_nm)
-    na = encode_keyence_double(0.2)
-    wd = encode_keyence_double(20.0)
+    cal = encode_packed_double(calibration_nm)
+    na = encode_packed_double(0.2)
+    wd = encode_packed_double(20.0)
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <Data><SingleFileProperty>
 <Image><OriginalImageSize><Width Type="System.Int32">{width}</Width><Height Type="System.Int32">{height}</Height></OriginalImageSize>
