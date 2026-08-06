@@ -28,6 +28,7 @@ if not getattr(sys, "frozen", False):
         pass
 
 import io
+import re
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -1296,6 +1297,17 @@ class MainWindow(QMainWindow):
             return
         label = ".ktf" if mode == StartModeDialog.KTF else "生画像"
         if not dirs:
+            if mode == StartModeDialog.RAW and _looks_like_xy_scan(folder):
+                self.statusBar().showMessage(
+                    f"“{folder.name}” は XY スキャン形式のため対応していません")
+                QMessageBox.information(
+                    self, "この撮影形式には対応していません",
+                    f"“{folder}” は組織切片などの <b>XY スキャン</b>形式に見えます"
+                    "（<code>XY01/</code> の下にタイルが連番で並ぶ形式）。<br><br>"
+                    "本ソフトが扱うのは<b>ウェルプレート撮影</b>で、ウェルごとの"
+                    "フォルダの下が <code>X###Y###</code>（視野位置）に分かれている"
+                    "ものです。")
+                return
             self.statusBar().showMessage(
                 f"“{folder.name}” の下に {label} の実験が見つかりませんでした"
                 + (f"（{errors} 件のフォルダを読めませんでした）" if errors else ""))
@@ -2661,6 +2673,37 @@ def _raw_wells_of(folder: Path) -> list:
 
 def _is_raw_experiment(folder: Path, dirnames=None) -> bool:
     return bool(_raw_wells_of(folder))
+
+
+#: sequentially-numbered tile, e.g. IPF1_XY01_00457_CHF.bz.ome.tif
+_XYSCAN_TILE = re.compile(r"_XY\d+_\d{4,}_CH[\w-]*\.bz\.ome\.tiff?$", re.IGNORECASE)
+
+
+def _looks_like_xy_scan(folder: Path) -> bool:
+    """An XY-scan (tissue-section) capture rather than a well plate.
+
+    Those store tiles as a flat run of sequential numbers under XY01/, with no
+    X###Y### position folders, so the plate reader legitimately finds nothing.
+    Recognising the shape lets the app say *why* instead of "no experiments".
+    """
+    # The user may point at the experiment itself or at a parent, so look a few
+    # levels down — but bounded, since this runs only to explain an empty result.
+    def scan(d: Path, depth: int) -> bool:
+        try:
+            entries = list(d.iterdir())[:400]
+        except OSError:
+            return False
+        for f in entries:
+            if f.is_file() and _XYSCAN_TILE.search(f.name):
+                return True
+        if depth <= 0:
+            return False
+        for sub in entries:
+            if sub.is_dir() and not sub.name.startswith("._") and scan(sub, depth - 1):
+                return True
+        return False
+
+    return scan(folder, 3)
 
 
 class StitchDialog(QDialog):
