@@ -138,8 +138,9 @@ class ImageCanvas(QWidget):
         self.zoom_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.zoom_edit.setToolTip("Zoom % — type a value and press Enter")
         self.zoom_edit.setStyleSheet(
-            "QLineEdit { background: rgba(0,0,0,150); color:#ddd; border:1px solid #555;"
-            " border-radius:4px; padding:1px; font-family:Menlo; font-size:11px; }")
+            "QLineEdit { background: rgba(255,255,255,225); color:#1c1e21;"
+            " border:1px solid #b6bcc4; border-radius:4px; padding:1px;"
+            " font-family:Menlo; font-size:11px; }")
         self.zoom_edit.editingFinished.connect(self._on_zoom_edit)
         self.zoom_edit.hide()
         self._position_overlays()
@@ -246,9 +247,9 @@ class ImageCanvas(QWidget):
     # --- painting ---
     def paintEvent(self, event):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(24, 24, 24))
+        p.fillRect(self.rect(), QColor(246, 247, 249))
         if not self._pixmap:
-            p.setPen(QColor(110, 110, 110))
+            p.setPen(QColor(120, 125, 132))
             p.setFont(QFont("Menlo", 13))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                        "Open an experiment folder, then click a well\n\n"
@@ -582,11 +583,11 @@ class WellPlateWidget(QWidget):
         cols = sorted({w[1:] for w in wells})
         for ci, col in enumerate(cols):
             lbl = QLabel(col); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color:#aaa; font-weight:bold;")
+            lbl.setStyleSheet("color:#3c4149; font-weight:bold;")
             self._layout.addWidget(lbl, 0, ci + 1)
         for ri, row in enumerate(rows):
             lbl = QLabel(row); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color:#aaa; font-weight:bold;")
+            lbl.setStyleSheet("color:#3c4149; font-weight:bold;")
             self._layout.addWidget(lbl, ri + 1, 0)
             for ci, col in enumerate(cols):
                 wid = f"{row}{col}"
@@ -600,10 +601,10 @@ class WellPlateWidget(QWidget):
                 btn.setToolTip(f"{wid}: {wt.n_tiles} fields, {len(wt.z_values)} Z, "
                                f"{', '.join(wt.channels)}")
                 btn.setStyleSheet("""
-                    QPushButton { background:#2a2a2a; border:1px dashed #666; border-radius:4px;
-                                  color:#ddd; font-size:10px; }
-                    QPushButton:hover { border-color:#88f; background:#333; }
-                    QPushButton:checked { border:2px solid #6a9; background:#26332e; }
+                    QPushButton { background:#ffffff; border:1px dashed #9aa1aa; border-radius:4px;
+                                  color:#1c1e21; font-size:10px; }
+                    QPushButton:hover { border-color:#5b8def; background:#eef3fb; }
+                    QPushButton:checked { border:2px solid #2f9e6e; background:#e6f5ee; }
                 """)
                 btn.clicked.connect(lambda _, w=wid: self._pick_raw(w))
                 self._layout.addWidget(btn, ri + 1, ci + 1)
@@ -627,12 +628,12 @@ class WellPlateWidget(QWidget):
         for ci, col in enumerate(cols):
             lbl = QLabel(col)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color:#aaa; font-weight:bold;")
+            lbl.setStyleSheet("color:#3c4149; font-weight:bold;")
             self._layout.addWidget(lbl, 0, ci + 1)
         for ri, row in enumerate(rows):
             lbl = QLabel(row)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color:#aaa; font-weight:bold;")
+            lbl.setStyleSheet("color:#3c4149; font-weight:bold;")
             self._layout.addWidget(lbl, ri + 1, 0)
             for ci, col in enumerate(cols):
                 wid = f"{row}{col}"
@@ -644,8 +645,9 @@ class WellPlateWidget(QWidget):
         btn.setFixedSize(120, 100)
         btn.setToolTip(f"{well_id}: {', '.join(sorted(channels.keys()))}")
         btn.setStyleSheet("""
-            QPushButton { background:#2a2a2a; border:1px solid #555; border-radius:4px; color:white; font-size:11px; }
-            QPushButton:hover { border-color:#88f; background:#333; }
+            QPushButton { background:#ffffff; border:1px solid #c2c7ce; border-radius:4px;
+                          color:#1c1e21; font-size:11px; }
+            QPushButton:hover { border-color:#5b8def; background:#eef3fb; }
         """)
         first = list(channels.values())[0]
         if first.thumbnail_jpeg:
@@ -681,10 +683,11 @@ class WellConditionsTable(QTableWidget):
         self.verticalHeader().setVisible(False)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ContiguousSelection)
         self.setStyleSheet("""
-            QTableWidget { background:#252525; color:#ddd; gridline-color:#3a3a3a;
-                           selection-background-color:#3a5a8a; }
-            QHeaderView::section { background:#333; color:#bbb; border:1px solid #444; padding:3px; }
-            QTableWidget QLineEdit { background:#1e1e1e; color:#fff; }
+            QTableWidget { background:#ffffff; color:#1c1e21; gridline-color:#dfe3e8;
+                           selection-background-color:#cfe1fb; selection-color:#0d1117; }
+            QHeaderView::section { background:#eceff3; color:#3c4149;
+                                   border:1px solid #d6dae0; padding:3px; }
+            QTableWidget QLineEdit { background:#ffffff; color:#1c1e21; }
         """)
         self.itemChanged.connect(self._on_item_changed)
 
@@ -774,7 +777,7 @@ class WellConditionsTable(QTableWidget):
         for r, wid in enumerate(well_ids):
             well_item = QTableWidgetItem(wid)
             well_item.setFlags(well_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            well_item.setForeground(QColor(150, 200, 255))
+            well_item.setForeground(QColor(29, 78, 216))
             self.setItem(r, 0, well_item)
             row_vals = saved.get(wid, [])
             for c in range(1, self.columnCount()):
@@ -943,7 +946,7 @@ class MainWindow(QMainWindow):
         cond_hint = QLabel("Paste from Excel (⌘/Ctrl+V) · double-click or right-click a "
                            "column title to rename · saved per experiment.")
         cond_hint.setWordWrap(True)
-        cond_hint.setStyleSheet("color:#888; font-size:10px;")
+        cond_hint.setStyleSheet("color:#6b7280; font-size:10px;")
         ct.addWidget(cond_hint)
         cond_btns = QHBoxLayout()
         for label, tip, slot in [
@@ -985,7 +988,7 @@ class MainWindow(QMainWindow):
 
         self.readout = QLabel("")
         self.readout.setFont(QFont("Menlo", 11))
-        self.readout.setStyleSheet("color:#9cf; padding:2px 6px;")
+        self.readout.setStyleSheet("color:#1d4ed8; padding:2px 6px;")
         self.readout.setFixedHeight(22)
         rl.addWidget(self.readout)
 
@@ -1051,7 +1054,7 @@ class MainWindow(QMainWindow):
         rp.addWidget(self.raw_summary)
         hint = QLabel("各視野のタイルを貼り合わせて 1 枚のウェル画像にします。"
                       "出力は OME-TIFF（Fiji / QuPath / napari で開けます）と PNG。")
-        hint.setWordWrap(True); hint.setStyleSheet("color:#888; font-size:11px;")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#6b7280; font-size:11px;")
         rp.addWidget(hint)
         self.btn_stitch_raw = QPushButton("Stitch Raw Tiles…")
         self.btn_stitch_raw.clicked.connect(self._stitch_raw_tiles)
@@ -1116,20 +1119,34 @@ class MainWindow(QMainWindow):
 
     def _apply_style(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background:#1e1e1e; color:#ddd; }
-            QGroupBox { border:1px solid #444; border-radius:4px; margin-top:8px; padding-top:12px; font-weight:bold; color:#aaa; }
+            QMainWindow, QWidget { background:#f4f5f7; color:#1c1e21; }
+            QGroupBox { border:1px solid #ccd0d6; border-radius:5px; margin-top:8px;
+                        padding-top:12px; font-weight:bold; color:#44484f;
+                        background:#fbfbfc; }
             QGroupBox::title { subcontrol-origin:margin; left:10px; }
-            QTreeWidget, QTextEdit { background:#252525; border:1px solid #333; }
-            QTreeWidget { selection-background-color:#3a5a8a; }
-            QSlider::groove:horizontal { height:4px; background:#444; border-radius:2px; }
-            QSlider::handle:horizontal { width:11px; height:11px; margin:-4px 0; background:#999; border-radius:5px; }
-            QPushButton { background:#3a3a3a; border:1px solid #555; border-radius:4px; padding:6px 10px; color:#ddd; }
-            QPushButton:hover { background:#4a4a4a; border-color:#88f; }
-            QToolButton { background:#333; border:1px solid #555; border-radius:3px; color:#ddd; }
-            QToolButton:checked { background:#c84; border-color:#fa6; }
-            QStatusBar { background:#252525; color:#888; }
-            QProgressBar { background:#333; border:none; }
-            QProgressBar::chunk { background:#58f; }
+            QTreeWidget, QTextEdit, QTableWidget, QLineEdit, QComboBox {
+                background:#ffffff; border:1px solid #ccd0d6; color:#1c1e21; }
+            QTreeWidget { selection-background-color:#cfe1fb; selection-color:#0d1117;
+                          alternate-background-color:#f7f8fa; }
+            QHeaderView::section { background:#eceff3; color:#3c4149;
+                                   border:1px solid #d6dae0; padding:3px; }
+            QTabBar::tab { background:#e6e9ee; color:#3c4149; padding:5px 12px;
+                           border:1px solid #ccd0d6; border-bottom:none;
+                           border-top-left-radius:4px; border-top-right-radius:4px; }
+            QTabBar::tab:selected { background:#ffffff; color:#0d1117; }
+            QSlider::groove:horizontal { height:4px; background:#d3d7dd; border-radius:2px; }
+            QSlider::handle:horizontal { width:11px; height:11px; margin:-4px 0;
+                                         background:#6b7280; border-radius:5px; }
+            QPushButton { background:#ffffff; border:1px solid #c2c7ce; border-radius:4px;
+                          padding:6px 10px; color:#1c1e21; }
+            QPushButton:hover { background:#eef3fb; border-color:#5b8def; }
+            QPushButton:disabled { background:#f0f1f3; color:#a0a4ab; border-color:#dcdfe4; }
+            QToolButton { background:#ffffff; border:1px solid #c2c7ce; border-radius:3px;
+                          color:#1c1e21; }
+            QToolButton:checked { background:#ffd8a8; border-color:#e8973a; }
+            QStatusBar { background:#eceff3; color:#4b5057; }
+            QProgressBar { background:#dfe3e8; border:none; }
+            QProgressBar::chunk { background:#3b82f6; }
         """)
 
     # ---------- scanning ----------
@@ -2374,11 +2391,11 @@ class StartModeDialog(QDialog):
             v = QVBoxLayout(box)
             d = QLabel(desc)
             d.setWordWrap(True)
-            d.setStyleSheet("color:#bbb;")
+            d.setStyleSheet("color:#4b5057;")
             v.addWidget(d)
             if last:
                 p = QLabel(f"前回: {last}")
-                p.setStyleSheet("color:#888; font-size:10px;")
+                p.setStyleSheet("color:#6b7280; font-size:10px;")
                 p.setWordWrap(True)
                 v.addWidget(p)
             b = QPushButton(btn_text)
@@ -2621,7 +2638,7 @@ class StitchDialog(QDialog):
         note = QLabel("Tile offsets are measured from the images themselves, so all "
                       "channels stay registered. Output opens in Fiji / QuPath / napari.")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#888; font-size:11px;")
+        note.setStyleSheet("color:#6b7280; font-size:11px;")
         lay.addWidget(note)
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
