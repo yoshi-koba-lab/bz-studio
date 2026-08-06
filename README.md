@@ -48,8 +48,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
-**File ▸ Open Folder**（`Ctrl/Cmd+O`）でデータを開きます。前回のフォルダは次回
-起動時に自動で開きます。
+起動すると **「.ktf から始める」「生画像から始める」** の選択画面が出ます。
+`.ktf` は貼り合わせ済みモザイクの表示、生画像は各視野のタイルからの
+スティッチングです。あとから **File ▸ Choose Workflow…** で切り替えられます。
+前回開いたフォルダはワークフローごとに記憶されます。
 
 **操作** — スクロール／ピンチ＝ズーム・ドラッグ＝移動・`Ctrl/Cmd+0`＝全体表示・
 `Ctrl/Cmd+1`＝100%・`Ctrl/Cmd+Shift+A`＝自動コントラスト。
@@ -134,7 +136,7 @@ pyinstaller --noconfirm ktf_viewer.spec
 
 `version.py` の `__version__` が唯一の正です。セマンティックバージョニング
 （MAJOR.MINOR.PATCH）で、MAJOR は出力形式や `.ktf` の読み取りに互換性のない変更、
-MINOR は後方互換のある機能追加、PATCH は修正のみ。現在 **1.0.0**。
+MINOR は後方互換のある機能追加、PATCH は修正のみ。現在 **1.1.0**。
 
 ## ライセンス
 

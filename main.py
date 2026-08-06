@@ -1250,14 +1250,10 @@ class MainWindow(QMainWindow):
         raw = mode == StartModeDialog.RAW
         self.folder_tree.setHeaderLabels(
             ["Name", "Wells", "Source"] if raw else ["Name", "Wells", "Channels"])
-        # Conditions belong to the .ktf model; hide them so stale values can never
-        # be shown against a raw experiment.
-        if hasattr(self, "well_tabs"):
-            idx = self.well_tabs.indexOf(self.cond_tab)
-            if raw and idx >= 0:
-                self.well_tabs.removeTab(idx)
-            elif not raw and idx < 0:
-                self.well_tabs.addTab(self.cond_tab, "Conditions")
+        # Conditions apply to both workflows; they are keyed by experiment path, and
+        # the table is repopulated per experiment so values can never leak across.
+        if hasattr(self, "well_tabs") and self.well_tabs.indexOf(self.cond_tab) < 0:
+            self.well_tabs.addTab(self.cond_tab, "Conditions")
         if hasattr(self, "raw_panel"):
             self.raw_panel.setVisible(raw)
         if hasattr(self, "ktf_bottom"):
@@ -1320,6 +1316,8 @@ class MainWindow(QMainWindow):
         self._raw_experiment = {"name": folder.name, "path": folder, "wells": wells}
         self._current_raw_well = None
         self.well_plate.set_raw_wells(wells)
+        saved = self._load_conditions()
+        self.conditions.set_wells(sorted(wells), saved)
         unusable = structural - set(wells)
         msg = (f"{folder.name}: {len(wells)} ウェル（生画像）— "
                f"ウェルを選ぶか、そのまま Stitch Raw Tiles… で全ウェルを処理できます")
@@ -1486,8 +1484,13 @@ class MainWindow(QMainWindow):
         self.readout.setText("")
 
     # ---------- sample conditions ----------
+    def _active_experiment(self):
+        """Whichever experiment is loaded — conditions belong to both workflows."""
+        return self._experiment or self._raw_experiment
+
     def _conditions_key(self):
-        p = self._experiment["path"] if self._experiment else None
+        exp = self._active_experiment()
+        p = exp["path"] if exp else None
         return f"conditions/{p}" if p else None
 
     def _load_conditions(self) -> dict:
@@ -1516,9 +1519,10 @@ class MainWindow(QMainWindow):
         QSettings().setValue(key, json.dumps(stored))
 
     def _export_conditions_csv(self):
-        if not self._experiment:
+        exp = self._active_experiment()
+        if not exp:
             return
-        default = f"{self._experiment['name']}_conditions.csv"
+        default = f"{exp['name']}_conditions.csv"
         path, _ = QFileDialog.getSaveFileName(self, "Export conditions CSV", default, "CSV (*.csv)")
         if not path:
             return

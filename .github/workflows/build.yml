@@ -17,18 +17,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-latest runners are Apple Silicon; a build made there will not run on
-          # Intel Macs, so build both. macos-13 is the last x86_64 runner image.
+          # macos-latest runners are Apple Silicon; a build made there will not run
+          # on Intel Macs, so build both. macos-13 was retired, so Intel builds use
+          # macos-15-intel.
           - os: macos-latest
             artifact: KTF-Viewer-macOS-appleSilicon
             bundle: "dist/KTF Viewer.app"
-          - os: macos-13
+          - os: macos-15-intel
             artifact: KTF-Viewer-macOS-intel
             bundle: "dist/KTF Viewer.app"
           - os: windows-latest
             artifact: KTF-Viewer-Windows
             bundle: "dist/KTF Viewer"
     runs-on: ${{ matrix.os }}
+    # A retired runner label queues forever instead of failing; cap it so a bad
+    # label is visible in minutes rather than blocking the release.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
