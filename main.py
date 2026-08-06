@@ -1796,6 +1796,10 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
         if not folder:
             return
+        problem = _writable_problem(Path(folder))
+        if problem:
+            QMessageBox.critical(self, "この場所には保存できません", problem)
+            return
         self._exporting = True
         out = Path(folder)
         wells = self._experiment["wells"]
@@ -1872,15 +1876,23 @@ class MainWindow(QMainWindow):
         out = QFileDialog.getExistingDirectory(self, "Save stitched images to")
         if not out:
             return
+        problem = _writable_problem(Path(out))
+        if problem:
+            QMessageBox.critical(self, "この場所には保存できません", problem)
+            return
 
         self._set_actions_enabled(False)
         self.btn_stitch_raw.setEnabled(False)
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
-        self._stitch_worker = StitchWorker(wells, out, dlg.z_mode, dlg.fmt,
-                                           flatfield=dlg.flatfield,
-                                           subpixel=dlg.subpixel)
+        cond = self.conditions.to_dict()
+        headers = cond.get("__headers__") or list(WellConditionsTable.DEFAULT_HEADERS)
+        self._stitch_worker = StitchWorker(
+            wells, out, dlg.z_mode, dlg.fmt,
+            flatfield=dlg.flatfield, subpixel=dlg.subpixel,
+            exp_name=self._raw_experiment["name"],
+            conditions=cond, cond_headers=headers)
         self._stitch_worker.progress.connect(self._on_stitch_progress)
         self._stitch_worker.done.connect(self._on_stitch_done)
         self._stitch_worker.start()
@@ -1913,8 +1925,12 @@ class MainWindow(QMainWindow):
             body += f"\n失敗: {failed} ウェル"
         if warn:
             body += "\n\n" + "\n".join(warn[:12]) + ("\n…" if len(warn) > 12 else "")
-            body += ("\n\n「alignment uncertain」は重なりが小さすぎるか特徴が乏しく"
-                     "測定できなかったことを示します — 該当ウェルを確認してください。")
+            if any("uncertain" in x or "inherited" in x for x in warn):
+                body += ("\n\n「alignment uncertain」は重なりが小さすぎるか特徴が乏しく"
+                         "測定できなかったことを示します — 該当ウェルを確認してください。")
+            if any("保存できません" in x or "書き込めません" in x for x in warn):
+                body += ("\n\n保存先に書き込めませんでした。別の場所（内蔵ディスクなど）"
+                         "を選び直してください。")
         box.setText(body)
         open_btn = box.addButton("出力フォルダを開く", QMessageBox.ButtonRole.ActionRole)
         box.addButton("閉じる", QMessageBox.ButtonRole.AcceptRole)
@@ -2398,6 +2414,90 @@ class ScanWorker(QThread):
         self.finished_scan.emit(sorted(found), errors)
 
 
+def _load_font_static(size):
+    for cand in ("Arial.ttf", "arial.ttf", "Helvetica.ttc", "DejaVuSans.ttf",
+                 "/System/Library/Fonts/Helvetica.ttc",
+                 "/System/Library/Fonts/Supplemental/Arial.ttf",
+                 r"C:\Windows\Fonts\arial.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(cand, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _draw_caption_static(canvas, draw, x, y, wid, lines, f_id, f_txt, inset, max_w):
+    """Well ID + conditions on a translucent plate, top-left of the image."""
+    gap = max(2, inset // 3)
+    idb = draw.textbbox((0, 0), wid, font=f_id)
+    w_max, h_total = idb[2] - idb[0], idb[3] - idb[1]
+    measured = []
+    for ln in lines:
+        b = draw.textbbox((0, 0), ln, font=f_txt)
+        measured.append((ln, b[3] - b[1]))
+        w_max = max(w_max, b[2] - b[0])
+        h_total += gap + (b[3] - b[1])
+    bw, bh = min(max_w, w_max + 2 * inset), h_total + 2 * inset
+    plate = Image.new("RGBA", (max(1, bw), max(1, bh)), (0, 0, 0, 150))
+    canvas.paste(plate, (x, y), plate)
+    ty = y + inset
+    draw.text((x + inset, ty), wid, fill=(255, 235, 60), font=f_id)
+    ty += (idb[3] - idb[1]) + gap
+    for ln, lh in measured:
+        draw.text((x + inset, ty), ln, fill=(240, 240, 240), font=f_txt)
+        ty += lh + gap
+
+
+def _writable_problem(folder: Path) -> str:
+    """Plain-language reason this folder cannot receive output, or "" if it can.
+
+    Checked before stitching: an NTFS volume mounts read-only on macOS, and
+    discovering that only after several minutes of work is the worst time.
+    """
+    try:
+        if not folder.is_dir():
+            return f"“{folder}” はフォルダではありません。"
+        try:
+            st = os.statvfs(folder)
+            if bool(st.f_flag & getattr(os, "ST_RDONLY", 1)):
+                return (f"“{folder}” は読み取り専用でマウントされています。\n\n"
+                        "NTFS でフォーマットされた外付けドライブは、macOS では既定で"
+                        "読み取り専用になり、書き込みできません。\n"
+                        "内蔵ディスクなど、書き込める場所を選び直してください。")
+        except (OSError, AttributeError):
+            pass
+        if not os.access(folder, os.W_OK):
+            return (f"“{folder}” に書き込む権限がありません。\n"
+                    "別の場所を選ぶか、フォルダの権限をご確認ください。")
+        probe = folder / ".ktfviewer_write_test"
+        try:
+            probe.touch()
+            probe.unlink()
+        except OSError as e:
+            return (f"“{folder}” に書き込めませんでした（{e.strerror or e}）。\n"
+                    "別の場所を選び直してください。")
+    except Exception as e:
+        return f"“{folder}” を確認できませんでした: {e}"
+    return ""
+
+
+def _friendly_error(e: Exception) -> str:
+    """Turn a low-level write failure into something a user can act on."""
+    txt = str(e)
+    if "Read-only file system" in txt or getattr(e, "errno", None) == 30:
+        return "保存先が読み取り専用のため書き込めません"
+    if "Permission denied" in txt or getattr(e, "errno", None) == 13:
+        return "保存先に書き込む権限がありません"
+    if "No space left" in txt or getattr(e, "errno", None) == 28:
+        return "保存先の空き容量が足りません"
+    # never surface the internal .part temp name
+    return txt.replace(".part", "")
+
+
 def _raw_wells_of(folder: Path) -> list:
     """Well folders directly under `folder` that hold X###Y### tile files.
 
@@ -2479,6 +2579,9 @@ class StitchDialog(QDialog):
             "OME-TIFF (multi-channel) only",
             "PNG composite only",
             "Separate TIFF per channel",
+            "PDF (1 well per page)",
+            "PDF contact sheet (all wells on one page)",
+            "OME-TIFF + PDF contact sheet",
         ])
         form.addWidget(self.cmb_fmt, r, 1); r += 1
         lay.addLayout(form)
@@ -2519,7 +2622,8 @@ class StitchDialog(QDialog):
 
     @property
     def fmt(self):
-        return ["both", "ometiff", "png", "split"][self.cmb_fmt.currentIndex()]
+        return ["both", "ometiff", "png", "split",
+                "pdf_pages", "pdf_sheet", "ometiff_pdf"][self.cmb_fmt.currentIndex()]
 
     @property
     def flatfield(self):
@@ -2535,8 +2639,13 @@ class StitchWorker(QThread):
     progress = pyqtSignal(str, float)          # message, 0..1
     done = pyqtSignal(int, int, str)           # ok, failed, out_dir
 
-    def __init__(self, wells, out_dir, z_mode, fmt, flatfield=True, subpixel=True):
+    def __init__(self, wells, out_dir, z_mode, fmt, flatfield=True, subpixel=True,
+                 exp_name="experiment", conditions=None, cond_headers=None):
         super().__init__()
+        self.exp_name = exp_name
+        self._cond = conditions or {}
+        self._cond_headers = cond_headers or []
+        self.sheet_panels = {}
         self.wells = wells
         self.out_dir = Path(out_dir)
         self.z_mode = z_mode
@@ -2549,6 +2658,17 @@ class StitchWorker(QThread):
 
     def cancel(self):
         self._cancel = True
+
+    def conditions_for(self, wid) -> list:
+        """"Header: value" lines for this well, from the Conditions tab."""
+        out = []
+        for i, val in enumerate(self._cond.get(wid, [])):
+            val = (val or "").strip()
+            if not val:
+                continue
+            head = self._cond_headers[i + 1] if i + 1 < len(self._cond_headers) else ""
+            out.append(f"{head}: {val}" if head else val)
+        return out
 
     def run(self):
         ok = failed = 0
@@ -2592,7 +2712,7 @@ class StitchWorker(QThread):
                 ok += 1
             except Exception as e:
                 print(f"Stitch error {wid}: {e}")
-                self.warnings.append(f"{wid}: {e}")
+                self.warnings.append(f"{wid}: {_friendly_error(e)}")
                 failed += 1
 
         for wid, wt in deferred:                 # second pass with the plate prior
@@ -2613,9 +2733,16 @@ class StitchWorker(QThread):
                 ok += 1
             except Exception as e:
                 print(f"Stitch error {wid}: {e}")
-                self.warnings.append(f"{wid}: {e}")
+                self.warnings.append(f"{wid}: {_friendly_error(e)}")
                 failed += 1
 
+        if self.fmt in ("pdf_sheet", "ometiff_pdf") and self.sheet_panels and not self._cancel:
+            self.progress.emit("コンタクトシート PDF を作成中…", -1.0)
+            try:
+                self._write_contact_sheet()
+            except Exception as e:
+                print(f"contact sheet failed: {e}")
+                self.warnings.append(f"コンタクトシート PDF: {_friendly_error(e)}")
         self._write_qc()
         self.done.emit(ok, failed, str(self.out_dir))
 
@@ -2681,25 +2808,101 @@ class StitchWorker(QThread):
         except Exception as e:
             print(f"QC write failed: {e}")
 
+    @staticmethod
+    def _composite(planes_data):
+        """Display-stretched RGB composite of a stitched well."""
+        views, images = [], {}
+        for p, img in planes_data:
+            nz = img[img > 0]
+            lo = int(np.percentile(nz, 1)) if nz.size else 0
+            hi = max(int(np.percentile(nz, 99.5)) if nz.size else 255, lo + 1)
+            color = p.color or CHANNEL_COLORS.get(p.channel, (200, 200, 200))
+            views.append(render.ChannelView(p.key, color, lo=lo, hi=hi))
+            images[p.key] = img
+        return Image.fromarray(render.composite(views, images))
+
     def _write(self, wid, wt, res):
         planes_data = [(p, img) for (p, img) in res.values()]
         pixel_um = stitcher.tile_pixel_um(wt)
-        if self.fmt in ("ometiff", "both"):
+        if self.fmt in ("ometiff", "both", "ometiff_pdf"):
             stitcher.save_ome_tiff(self.out_dir / f"{wid}.ome.tif", planes_data, pixel_um)
         if self.fmt == "split":
             for p, img in planes_data:
                 Image.fromarray(img).save(self.out_dir / f"{wid}_{p.label}.tif")
         if self.fmt in ("png", "both"):
-            views, images = [], {}
-            for p, img in planes_data:
-                nz = img[img > 0]
-                lo = int(np.percentile(nz, 1)) if nz.size else 0
-                hi = max(int(np.percentile(nz, 99.5)) if nz.size else 255, lo + 1)
-                color = p.color or CHANNEL_COLORS.get(p.channel, (200, 200, 200))
-                views.append(render.ChannelView(p.key, color, lo=lo, hi=hi))
-                images[p.key] = img
-            Image.fromarray(render.composite(views, images)).save(
-                self.out_dir / f"{wid}.png")
+            self._composite(planes_data).save(self.out_dir / f"{wid}.png")
+        if self.fmt == "pdf_pages":
+            im = self._composite(planes_data)
+            self._label_and_save_pdf(im, wid, self.out_dir / f"{wid}.pdf")
+        if self.fmt in ("pdf_sheet", "ometiff_pdf"):
+            # keep a downscaled panel; the full sheet is written once at the end
+            im = self._composite(planes_data)
+            im.thumbnail((self.SHEET_PANEL, self.SHEET_PANEL), Image.Resampling.LANCZOS)
+            self.sheet_panels[wid] = im
+
+    #: long edge of each well panel on the contact sheet
+    SHEET_PANEL = 1100
+
+    def _label_and_save_pdf(self, im, wid, path):
+        """One well per page, with its conditions printed on the image."""
+        band = max(48, im.height // 24)
+        page = Image.new("RGB", (im.width, im.height + band), (255, 255, 255))
+        page.paste(im.convert("RGB"), (0, band))
+        d = ImageDraw.Draw(page)
+        f_hdr = _load_font_static(max(20, band // 2))
+        d.text((10, band // 5), f"{self.exp_name}   {wid}   ({im.width}×{im.height})",
+               fill=(0, 0, 0), font=f_hdr)
+        lines = self.conditions_for(wid)
+        if lines:
+            _draw_caption_static(page, d, 16, band + 16, wid, lines,
+                                 _load_font_static(max(22, band // 2)),
+                                 _load_font_static(max(16, band // 3)), 12,
+                                 page.width - 32)
+        tmp = Path(str(path) + ".part")
+        page.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0)
+        tmp.replace(path)
+
+    def _write_contact_sheet(self):
+        """All wells on one page, in plate layout, with their conditions."""
+        if not self.sheet_panels:
+            return
+        wells = sorted(self.sheet_panels)
+        rows = sorted({w[0] for w in wells})
+        cols = sorted({w[1:] for w in wells}, key=lambda c: int(c) if c.isdigit() else 0)
+        cw = max(im.width for im in self.sheet_panels.values())
+        ch = max(im.height for im in self.sheet_panels.values())
+        k = cw / 380.0
+        pad, hdr, title_h = int(12 * k), int(30 * k), int(48 * k)
+        W = hdr + len(cols) * (cw + pad) + pad
+        H = title_h + hdr + len(rows) * (ch + pad) + pad
+        sheet = Image.new("RGB", (W, H), (255, 255, 255))
+        d = ImageDraw.Draw(sheet)
+        f_title, f_hdr = _load_font_static(int(26 * k)), _load_font_static(int(20 * k))
+        f_lbl, f_cond = _load_font_static(int(17 * k)), _load_font_static(int(13 * k))
+        d.text((pad, pad), f"{self.exp_name}  ·  {len(wells)} wells",
+               fill=(0, 0, 0), font=f_title)
+        for ci, col in enumerate(cols):
+            d.text((hdr + ci * (cw + pad) + cw // 2, title_h + hdr // 2), col,
+                   fill=(0, 0, 0), font=f_hdr, anchor="mm")
+        for ri, row in enumerate(rows):
+            y0 = title_h + hdr + ri * (ch + pad)
+            d.text((hdr // 2, y0 + ch // 2), row, fill=(0, 0, 0), font=f_hdr, anchor="mm")
+            for ci, col in enumerate(cols):
+                wid = f"{row}{col}"
+                if wid not in self.sheet_panels:
+                    continue
+                x0 = hdr + ci * (cw + pad)
+                im = self.sheet_panels[wid]
+                d.rectangle([x0, y0, x0 + cw, y0 + ch], fill=(10, 10, 10))
+                sheet.paste(im.convert("RGB"),
+                            (x0 + (cw - im.width) // 2, y0 + (ch - im.height) // 2))
+                _draw_caption_static(sheet, d, x0 + int(6 * k), y0 + int(6 * k), wid,
+                                     self.conditions_for(wid), f_lbl, f_cond,
+                                     max(4, int(6 * k)), cw - int(12 * k))
+        path = self.out_dir / f"{self.exp_name}_plate.pdf"
+        tmp = Path(str(path) + ".part")
+        sheet.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0)
+        tmp.replace(path)
 
 
 class LeftAffirmativeStyle(QProxyStyle):

@@ -7,5 +7,5 @@ mirrored in the packaging metadata. Semantic versioning — MAJOR.MINOR.PATCH:
   PATCH  fixes only
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "KTF Viewer"
