@@ -2715,12 +2715,12 @@ class StitchDialog(QDialog):
         form.addWidget(self.cmb_fmt, r, 1); r += 1
         lay.addLayout(form)
 
-        self.chk_flat = QCheckBox("Correct illumination (flat-field) — needed for quantification")
-        self.chk_flat.setChecked(True)
+        self.chk_flat = QCheckBox("照明ムラ補正（フラットフィールド）")
+        self.chk_flat.setChecked(False)   # off by default: leave the pixels untouched
         self.chk_flat.setToolTip(
-            "Divides out the vignetting, estimated per channel from the tiles.\n"
-            "Without it a uniform specimen reads ±40 grey levels depending only\n"
-            "on where in the field it fell.")
+            "各チャンネルのタイル群から照明プロファイルを推定し、保存する画素に適用します。\n"
+            "既定はオフ（撮影されたままの値）です。同じ明るさの標本が視野内の位置だけで\n"
+            "±40 階調ずれるため、ウェル間で強度を比較する場合はオンにしてください。")
         lay.addWidget(self.chk_flat)
         self.chk_sub = QCheckBox("Sub-pixel seam check (slower, writes stitch_qc.csv)")
         self.chk_sub.setChecked(True)

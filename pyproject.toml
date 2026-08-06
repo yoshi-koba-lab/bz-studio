@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bz-plate-studio"
-version = "1.4.1"
+version = "1.4.2"
 description = "Well-plate viewer and tile stitcher for BZ-X microscope images"
 readme = "README.md"
 requires-python = ">=3.9"
