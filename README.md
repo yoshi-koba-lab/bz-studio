@@ -141,7 +141,7 @@ pyinstaller --noconfirm ktf_viewer.spec
 
 `version.py` の `__version__` が唯一の正です。セマンティックバージョニング
 （MAJOR.MINOR.PATCH）で、MAJOR は出力形式や `.ktf` の読み取りに互換性のない変更、
-MINOR は後方互換のある機能追加、PATCH は修正のみ。現在 **1.3.0**。
+MINOR は後方互換のある機能追加、PATCH は修正のみ。現在 **1.3.1**。
 
 ## ライセンス
 

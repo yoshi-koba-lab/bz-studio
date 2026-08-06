@@ -958,6 +958,10 @@ class MainWindow(QMainWindow):
             b.setToolTip(tip)
             b.clicked.connect(slot)
             cond_btns.addWidget(b)
+        b_clear = QPushButton("全消去")
+        b_clear.setToolTip("この実験のサンプル条件をすべて消去します")
+        b_clear.clicked.connect(self._clear_conditions)
+        cond_btns.addWidget(b_clear)
         cond_btns.addStretch()
         b_csv = QPushButton("Export CSV")
         b_csv.clicked.connect(self._export_conditions_csv)
@@ -1517,6 +1521,22 @@ class MainWindow(QMainWindow):
         stored = self._load_conditions()
         stored.update(self.conditions.to_dict())
         QSettings().setValue(key, json.dumps(stored))
+
+    def _clear_conditions(self):
+        exp = self._active_experiment()
+        if not exp:
+            return
+        if QMessageBox.question(
+                self, "サンプル条件の消去",
+                f"“{exp['name']}” のサンプル条件をすべて消去しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        key = self._conditions_key()
+        if key:
+            QSettings().remove(key)
+        self.conditions.set_wells(sorted(exp["wells"]), {})
+        self.statusBar().showMessage(f"{exp['name']}: サンプル条件を消去しました")
 
     def _export_conditions_csv(self):
         exp = self._active_experiment()
@@ -2960,7 +2980,10 @@ def _install_excepthook():
 def main():
     app = QApplication(sys.argv)
     app.setOrganizationName("KTFViewer")
-    app.setApplicationName(APP_NAME)
+    # Automated runs must never write into the real user settings — a test that
+    # fills the Conditions table would otherwise persist against a real experiment.
+    app.setApplicationName(
+        APP_NAME + " (test)" if os.environ.get("KTF_VIEWER_TEST") else APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle(LeftAffirmativeStyle())   # Yes/OK on the left
     _install_excepthook()
