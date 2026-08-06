@@ -509,22 +509,35 @@ def _box(a: np.ndarray, k: int) -> np.ndarray:
 
 
 def estimate_flatfield(tiles: list, smooth_frac: float = 0.12,
-                       lo_pct: float = 25.0) -> np.ndarray:
+                       pct: float = None) -> np.ndarray:
     """Multiplicative shading field (mean 1) estimated from the tiles themselves.
 
     With only 21-60 fields — and a specimen that can fill most of every field —
     a per-pixel *median* still contains specimen. BaSiC's low-rank/sparse
     decomposition is the field standard but wants a larger, more diverse stack.
-    What survives at this tile count is a low-percentile ("darkest common
-    background") estimate: at each pixel take a low percentile across tiles, which
-    tracks the illumination floor rather than the objects, then smooth heavily,
-    since real shading is smooth by construction.
+    What survives at this tile count is a percentile across tiles, chosen so it
+    samples the ILLUMINATION rather than the objects, then smoothed heavily since
+    real shading is smooth by construction.
+
+    Which percentile depends on the contrast polarity, and getting it backwards is
+    worse than not correcting at all (measured on real brightfield: a low
+    percentile made the non-uniformity 4.6x worse):
+
+    * fluorescence — objects are BRIGHTER than background, so a LOW percentile
+      tracks the illuminated background;
+    * brightfield — objects are DARKER than the field, so a HIGH percentile
+      tracks the unobstructed light path.
+
+    Polarity is detected from the data (mean vs median) unless `pct` is given.
 
     Returns a field to DIVIDE by; it is clipped so a bad estimate cannot blow up
     the corrected image.
     """
     stack = np.stack([t.astype(np.float32) for t in tiles])
-    prof = np.percentile(stack, lo_pct, axis=0)
+    if pct is None:
+        # mean above median => a bright-object (fluorescence) scene, and vice versa
+        pct = 25.0 if float(stack.mean() - np.median(stack)) > 0 else 75.0
+    prof = np.percentile(stack, pct, axis=0)
     k = max(3, int(min(prof.shape) * smooth_frac))
     prof = _box(prof, k)
     m = float(prof.mean())

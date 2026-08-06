@@ -44,11 +44,11 @@ from PyQt6.QtWidgets import (
     QProxyStyle, QStyle, QDialogButtonBox, QDialog, QComboBox,
 )
 from PyQt6.QtCore import (
-    Qt, QSize, pyqtSignal, QPoint, QRect, QThread, QTimer, QPointF, QEvent, QSettings,
+    Qt, QSize, pyqtSignal, QPoint, QRect, QThread, QTimer, QPointF, QEvent, QSettings, QUrl,
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QAction, QWheelEvent,
-    QMouseEvent, QPen, QFont, QKeySequence, QBrush,
+    QMouseEvent, QPen, QFont, QKeySequence, QBrush, QDesktopServices,
 )
 
 import ktf_reader
@@ -570,6 +570,51 @@ class WellPlateWidget(QWidget):
         self._layout = QGridLayout(self)
         self._layout.setSpacing(4)
 
+    def set_raw_wells(self, wells: dict):
+        """Raw mode has no embedded thumbnails — show the field/Z/channel counts."""
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if not wells:
+            return
+        rows = sorted({w[0] for w in wells})
+        cols = sorted({w[1:] for w in wells})
+        for ci, col in enumerate(cols):
+            lbl = QLabel(col); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("color:#aaa; font-weight:bold;")
+            self._layout.addWidget(lbl, 0, ci + 1)
+        for ri, row in enumerate(rows):
+            lbl = QLabel(row); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("color:#aaa; font-weight:bold;")
+            self._layout.addWidget(lbl, ri + 1, 0)
+            for ci, col in enumerate(cols):
+                wid = f"{row}{col}"
+                if wid not in wells:
+                    continue
+                wt = wells[wid]
+                btn = QPushButton(
+                    f"{wid}\n{wt.n_tiles} 視野\nZ {len(wt.z_values)}\n{','.join(wt.channels)}")
+                btn.setFixedSize(120, 100)
+                btn.setCheckable(True)
+                btn.setToolTip(f"{wid}: {wt.n_tiles} fields, {len(wt.z_values)} Z, "
+                               f"{', '.join(wt.channels)}")
+                btn.setStyleSheet("""
+                    QPushButton { background:#2a2a2a; border:1px dashed #666; border-radius:4px;
+                                  color:#ddd; font-size:10px; }
+                    QPushButton:hover { border-color:#88f; background:#333; }
+                    QPushButton:checked { border:2px solid #6a9; background:#26332e; }
+                """)
+                btn.clicked.connect(lambda _, w=wid: self._pick_raw(w))
+                self._layout.addWidget(btn, ri + 1, ci + 1)
+
+    def _pick_raw(self, well_id):
+        for i in range(self._layout.count()):
+            w = self._layout.itemAt(i).widget()
+            if isinstance(w, QPushButton):
+                w.setChecked(w.text().split("\n")[0] == well_id)
+        self.well_clicked.emit(well_id)
+
     def set_wells(self, well_data: dict):
         while self._layout.count():
             item = self._layout.takeAt(0)
@@ -841,6 +886,11 @@ class MainWindow(QMainWindow):
         self._pending = 0
         self._gen = 0                 # bumped on every well load; stale worker results discarded
         self._detail_pending = False  # a viewport changed while a detail worker was running
+        self._mode = None             # None | "ktf" | "raw"
+        self._raw_experiment = None   # raw model, kept separate from _experiment
+        self._current_raw_well = None
+        self._scan_worker = None
+        self._pending_root = None     # committed to settings only after a good load
         self._exporting = False       # a synchronous export is running
         self._stitch_worker = None    # asynchronous stitch (own lifetime)
         self._current_composite = None
@@ -874,15 +924,17 @@ class MainWindow(QMainWindow):
         well_group = QGroupBox("Well Plate")
         wg = QVBoxLayout(well_group)
         well_tabs = QTabWidget()
+        self.well_tabs = well_tabs
 
         self.well_plate = WellPlateWidget()
-        self.well_plate.well_clicked.connect(self._on_well_clicked)
+        self.well_plate.well_clicked.connect(self._dispatch_well_clicked)
         ws = QScrollArea()
         ws.setWidget(self.well_plate)
         ws.setWidgetResizable(True)
         well_tabs.addTab(ws, "Plate")
 
         cond_tab = QWidget()
+        self.cond_tab = cond_tab
         ct = QVBoxLayout(cond_tab)
         ct.setContentsMargins(2, 2, 2, 2)
         self.conditions = WellConditionsTable()
@@ -984,7 +1036,26 @@ class MainWindow(QMainWindow):
         bl.addWidget(export_group)
 
         bottom.setMaximumHeight(200)
+        self.ktf_bottom = bottom
         rl.addWidget(bottom, stretch=0)
+
+        # Raw workflow panel — shown instead of the KTF viewer controls
+        self.raw_panel = QGroupBox("生画像ワークフロー")
+        rp = QVBoxLayout(self.raw_panel)
+        self.raw_summary = QLabel("")
+        self.raw_summary.setWordWrap(True)
+        rp.addWidget(self.raw_summary)
+        hint = QLabel("各視野のタイルを貼り合わせて 1 枚のウェル画像にします。"
+                      "出力は OME-TIFF（Fiji / QuPath / napari で開けます）と PNG。")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#888; font-size:11px;")
+        rp.addWidget(hint)
+        self.btn_stitch_raw = QPushButton("Stitch Raw Tiles…")
+        self.btn_stitch_raw.clicked.connect(self._stitch_raw_tiles)
+        rp.addWidget(self.btn_stitch_raw)
+        rp.addStretch()
+        self.raw_panel.setMaximumHeight(200)
+        self.raw_panel.setVisible(False)
+        rl.addWidget(self.raw_panel, stretch=0)
         splitter.addWidget(right)
         splitter.setSizes([380, 1120])
         self.statusBar().showMessage("Open an experiment folder to begin")
@@ -992,9 +1063,14 @@ class MainWindow(QMainWindow):
     def _setup_menu(self):
         menu = self.menuBar()
         fm = menu.addMenu("File")
+        a = QAction("Choose Workflow…", self)
+        a.setStatusTip("Switch between .ktf viewing and raw-tile stitching")
+        a.triggered.connect(self._show_start_chooser); fm.addAction(a)
+        self.act_workflow = a
         a = QAction("Open Folder...", self); a.setShortcut(QKeySequence("Ctrl+O"))
-        a.setStatusTip("Open an experiment folder, or any folder that contains experiments")
+        a.setStatusTip("Open a folder for the current workflow")
         a.triggered.connect(self._open_folder); fm.addAction(a)
+        self.act_open = a
         fm.addSeparator()
         a = QAction("Quit", self); a.setShortcut(QKeySequence("Ctrl+Q"))
         a.triggered.connect(self.close); fm.addAction(a)
@@ -1053,14 +1129,44 @@ class MainWindow(QMainWindow):
         """)
 
     # ---------- scanning ----------
-    def _open_folder(self):
-        start = QSettings().value("last_root", "") or str(Path.home())
-        f = QFileDialog.getExistingDirectory(
-            self, "Open a folder (an experiment, or any folder containing them)", start)
-        if f:
-            self._open_path(Path(f))
+    # ---------- workflow selection ----------
+    def _recent(self, mode):
+        s = QSettings()
+        if mode == StartModeDialog.KTF:
+            return s.value("last_ktf_root", "") or s.value("last_root", "") or ""
+        return s.value("last_raw_root", "") or ""
 
-    # kept for the menu alias; behaves identically now (smart, level-agnostic)
+    def _show_start_chooser(self):
+        if self._busy:
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
+            return
+        dlg = StartModeDialog(self, self._recent(StartModeDialog.KTF),
+                              self._recent(StartModeDialog.RAW))
+        dlg.setStyleSheet("")
+        if dlg.exec() and dlg.choice:
+            self._choose_folder(dlg.choice)
+        elif self._mode is None:
+            self.statusBar().showMessage(
+                "File ▸ Choose Workflow… から開始してください")
+
+    def _choose_folder(self, mode):
+        start = self._recent(mode) or str(Path.home())
+        if not Path(start).is_dir():
+            start = str(Path.home())
+        title = ("Open a .ktf experiment folder (or any folder containing them)"
+                 if mode == StartModeDialog.KTF else
+                 "Open a raw-tile experiment folder (or any folder containing them)")
+        f = QFileDialog.getExistingDirectory(self, title, start)
+        if not f:
+            return
+        self._open_path(Path(f), mode)
+
+    def _open_folder(self):
+        if self._mode is None:
+            self._show_start_chooser()
+        else:
+            self._choose_folder(self._mode)
+
     def _open_data_root(self):
         self._open_folder()
 
@@ -1078,23 +1184,178 @@ class MainWindow(QMainWindow):
                 dirnames[:] = []  # prune tile subfolders
         return sorted(found)
 
-    def _open_path(self, folder: Path):
-        """Open any folder level: a single experiment loads directly; a folder that
-        contains several experiments builds a browsable tree."""
-        QSettings().setValue("last_root", str(folder))
-        self.statusBar().showMessage(f"Scanning {folder}...")
-        QApplication.processEvents()
-        exp_dirs = self._find_experiment_dirs(folder)
-        self.folder_tree.clear()
-        if not exp_dirs:
-            self.statusBar().showMessage(f"No .ktf files found under “{folder.name}”")
+    def _open_path(self, folder: Path, mode: str = None):
+        """Discover experiments of `mode` under `folder`, off the GUI thread."""
+        mode = mode or self._mode or StartModeDialog.KTF
+        if self._busy:
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
             return
-        # Always list what was found, so the Experiments panel reflects the open folder.
-        self._populate_tree(folder, exp_dirs)
-        if len(exp_dirs) == 1:
-            # A single experiment: open it immediately, and select its row.
-            self._select_tree_item(exp_dirs[0])
-            self._load_experiment(exp_dirs[0])
+        # A whole drive can hold tens of thousands of directories.
+        if folder.parent == folder or str(folder).rstrip("/") in ("/Volumes", ""):
+            ans = QMessageBox.question(
+                self, "ドライブ全体をスキャンしますか",
+                f"“{folder}” 全体の走査は数分かかることがあります。\n続けますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        self._pending_root = (folder, mode)
+        self.statusBar().showMessage(f"スキャン中: {folder} …")
+        self.progress_bar.setRange(0, 0)          # indeterminate
+        self.progress_bar.show()
+        self._set_actions_enabled(False)
+        self._scan_worker = ScanWorker(folder, mode)
+        self._scan_worker.progress.connect(
+            lambda d, n: self.statusBar().showMessage(f"スキャン中 ({n} フォルダ): {d}"))
+        self._scan_worker.finished_scan.connect(self._on_scan_done)
+        self._scan_worker.start()
+
+    def _set_actions_enabled(self, on: bool):
+        for a in (getattr(self, "act_open", None), getattr(self, "act_workflow", None)):
+            if a is not None:
+                a.setEnabled(on)
+
+    def _on_scan_done(self, dirs, errors):
+        self.progress_bar.hide()
+        self.progress_bar.setRange(0, 1000)
+        self._set_actions_enabled(True)
+        folder, mode = self._pending_root or (None, None)
+        if dirs is None:                      # cancelled
+            self.statusBar().showMessage("スキャンを中止しました。")
+            return
+        label = ".ktf" if mode == StartModeDialog.KTF else "生画像"
+        if not dirs:
+            self.statusBar().showMessage(
+                f"“{folder.name}” の下に {label} の実験が見つかりませんでした"
+                + (f"（{errors} 件のフォルダを読めませんでした）" if errors else ""))
+            QMessageBox.information(
+                self, "実験が見つかりません",
+                f"“{folder}” の下に{label}形式の実験はありませんでした。\n\n"
+                "別のフォルダを選ぶか、File ▸ Choose Workflow… で"
+                "もう一方のワークフローをお試しください。")
+            return
+        self._set_mode(mode)
+        self.folder_tree.clear()
+        if mode == StartModeDialog.KTF:
+            self._populate_tree(folder, dirs)
+        else:
+            self._populate_raw_tree(folder, dirs)
+        if len(dirs) == 1:
+            self._select_tree_item(dirs[0])
+            self._on_experiment_selected(self.folder_tree.currentItem(), 0)
+
+    def _set_mode(self, mode):
+        self._mode = mode
+        raw = mode == StartModeDialog.RAW
+        self.folder_tree.setHeaderLabels(
+            ["Name", "Wells", "Source"] if raw else ["Name", "Wells", "Channels"])
+        # Conditions belong to the .ktf model; hide them so stale values can never
+        # be shown against a raw experiment.
+        if hasattr(self, "well_tabs"):
+            idx = self.well_tabs.indexOf(self.cond_tab)
+            if raw and idx >= 0:
+                self.well_tabs.removeTab(idx)
+            elif not raw and idx < 0:
+                self.well_tabs.addTab(self.cond_tab, "Conditions")
+        if hasattr(self, "raw_panel"):
+            self.raw_panel.setVisible(raw)
+        if hasattr(self, "ktf_bottom"):
+            self.ktf_bottom.setVisible(not raw)
+        self.setWindowTitle(f"{APP_NAME} {__version__} — "
+                            + ("生画像（スティッチング）" if raw else ".ktf 表示"))
+
+    def _commit_root(self):
+        """Remember the browse root only once something actually loaded."""
+        if not self._pending_root:
+            return
+        folder, mode = self._pending_root
+        key = "last_ktf_root" if mode == StartModeDialog.KTF else "last_raw_root"
+        QSettings().setValue(key, str(folder))
+
+    def _populate_raw_tree(self, root: Path, exp_dirs: list):
+        groups = {}
+        for d in exp_dirs:
+            try:
+                rel = d.relative_to(root)
+            except ValueError:
+                rel = Path(d.name)
+            grp = rel.parts[0] if len(rel.parts) > 1 else ""
+            label = str(Path(*rel.parts[1:])) if len(rel.parts) > 1 else (
+                rel.parts[0] if rel.parts else d.name)
+            groups.setdefault(grp, []).append((label, d))
+        for grp in sorted(groups):
+            container = self.folder_tree
+            if grp:
+                parent = QTreeWidgetItem(self.folder_tree)
+                parent.setText(0, grp)
+                container = parent
+            for label, d in sorted(groups[grp]):
+                item = QTreeWidgetItem(container)
+                item.setText(0, label)
+                item.setText(1, str(len(_raw_wells_of(d))))
+                item.setText(2, "Raw tiles")
+                item.setData(0, Qt.ItemDataRole.UserRole, str(d))
+                item.setData(0, Qt.ItemDataRole.UserRole + 1, StartModeDialog.RAW)
+        self.folder_tree.expandAll()
+        self.statusBar().showMessage(
+            f"“{root.name}” に生画像の実験が {len(exp_dirs)} 件 — ダブルクリックで開きます")
+
+    def _load_raw_experiment(self, folder: Path):
+        """Build the raw model with the stitcher's own reader."""
+        self.statusBar().showMessage(f"{folder.name} を読み込み中…")
+        QApplication.processEvents()
+        try:
+            wells = stitcher.discover_wells(folder)
+        except Exception as e:
+            self.statusBar().showMessage(f"“{folder.name}” を読めませんでした: {e}")
+            return False
+        structural = set(_raw_wells_of(folder))
+        if not wells:
+            self.statusBar().showMessage(
+                f"“{folder.name}”: タイル名は見つかりましたが、読めるタイル画像がありません")
+            return False
+        self._experiment = None            # the two models never coexist
+        self._reset_well_state()
+        self._raw_experiment = {"name": folder.name, "path": folder, "wells": wells}
+        self._current_raw_well = None
+        self.well_plate.set_raw_wells(wells)
+        unusable = structural - set(wells)
+        msg = (f"{folder.name}: {len(wells)} ウェル（生画像）— "
+               f"ウェルを選ぶか、そのまま Stitch Raw Tiles… で全ウェルを処理できます")
+        if unusable:
+            msg += f" / 使用不可: {', '.join(sorted(unusable))}"
+        self.statusBar().showMessage(msg)
+        self._update_raw_summary()
+        self._commit_root()
+        return True
+
+    def _on_raw_well_selected(self, well_id: str):
+        self._current_raw_well = well_id
+        self._update_raw_summary()
+
+    def _update_raw_summary(self):
+        if not hasattr(self, "raw_summary"):
+            return
+        if not self._raw_experiment:
+            self.raw_summary.setText("")
+            return
+        wells = self._raw_experiment["wells"]
+        lines = [f"<b>{self._raw_experiment['name']}</b> — {len(wells)} ウェル"]
+        if self._current_raw_well and self._current_raw_well in wells:
+            wt = wells[self._current_raw_well]
+            lines.append(f"選択中: <b>{self._current_raw_well}</b> — "
+                         f"{wt.n_tiles} 視野 · Z {len(wt.z_values)} · "
+                         f"{', '.join(wt.channels)}")
+        else:
+            lines.append("ウェル未選択（全ウェルを処理できます）")
+        self.raw_summary.setText("<br>".join(lines))
+
+    def _dispatch_well_clicked(self, well_id: str):
+        if self._mode == StartModeDialog.RAW:
+            self._on_raw_well_selected(well_id)
+        else:
+            self._on_well_clicked(well_id)
 
     def _select_tree_item(self, path: Path):
         """Highlight the tree row whose stored path matches `path`."""
@@ -1147,6 +1408,7 @@ class MainWindow(QMainWindow):
                 item.setText(1, str(len(wells)))
                 item.setText(2, ", ".join(sorted(channels)))
                 item.setData(0, Qt.ItemDataRole.UserRole, str(d))
+                item.setData(0, Qt.ItemDataRole.UserRole + 1, StartModeDialog.KTF)
         self.folder_tree.expandAll()
         self.statusBar().showMessage(
             f"Found {len(exp_dirs)} experiments under “{root.name}” — double-click one to open")
@@ -1157,11 +1419,18 @@ class MainWindow(QMainWindow):
 
     def _on_experiment_selected(self, item, col):
         # Parent (folder) rows just expand/collapse; only leaf experiments load.
+        if item is None:
+            return
         if item.childCount() > 0:
             item.setExpanded(not item.isExpanded())
             return
         path = item.data(0, Qt.ItemDataRole.UserRole)
-        if path:
+        if not path:
+            return
+        mode = item.data(0, Qt.ItemDataRole.UserRole + 1) or StartModeDialog.KTF
+        if mode == StartModeDialog.RAW:
+            self._load_raw_experiment(Path(path))
+        else:
             self._load_experiment(Path(path))
 
     def _load_experiment(self, folder: Path):
@@ -1191,6 +1460,9 @@ class MainWindow(QMainWindow):
         if not experiment["wells"]:
             msg = f"No readable wells in “{experiment['name']}”" + \
                   (f" ({len(skipped)} file(s) unreadable)" if skipped else "")
+        else:
+            self._raw_experiment = None       # the two models never coexist
+            self._commit_root()
         self.statusBar().showMessage(msg)
 
     def _reset_well_state(self):
@@ -1572,42 +1844,33 @@ class MainWindow(QMainWindow):
 
     # ---------- stitching raw tiles ----------
     def _stitch_raw_tiles(self):
-        if not self._experiment:
-            self.statusBar().showMessage("Open an experiment first.")
-            return
+        """Stitch the loaded RAW experiment. Never touches the .ktf model."""
         if self._busy:
-            self.statusBar().showMessage("Another operation is running — please wait.")
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
             return
-        exp_dir = Path(self._experiment["path"])
-        self.statusBar().showMessage("Looking for raw tiles…")
-        QApplication.processEvents()
-        try:
-            wells = stitcher.discover_wells(exp_dir)
-        except Exception as e:
-            self.statusBar().showMessage(f"Could not scan tiles: {e}")
+        if not self._raw_experiment or not self._raw_experiment.get("wells"):
+            self.statusBar().showMessage(
+                "生画像の実験を開いてください（File ▸ Choose Workflow… ▸ 生画像から始める）")
             return
-        if not wells:
-            QMessageBox.information(
-                self, "No raw tiles",
-                f"No per-field tiles (X###Y### folders) were found under\n“{exp_dir.name}”.\n\n"
-                "Stitching needs the original per-field capture folders.")
-            return
+        wells = self._raw_experiment["wells"]
 
-        dlg = StitchDialog(wells, self)
+        dlg = StitchDialog(wells, self, current_well=self._current_raw_well)
         dlg.setStyleSheet("")
         if not dlg.exec():
             return
         if not dlg.all_wells:
-            if self._current_well and self._current_well in wells:
-                wells = {self._current_well: wells[self._current_well]}
-            else:
-                self.statusBar().showMessage("Select a well first.")
+            wid = self._current_raw_well
+            if not wid or wid not in wells:
+                self.statusBar().showMessage("ウェルを選んでください。")
                 return
+            wells = {wid: wells[wid]}
 
         out = QFileDialog.getExistingDirectory(self, "Save stitched images to")
         if not out:
             return
 
+        self._set_actions_enabled(False)
+        self.btn_stitch_raw.setEnabled(False)
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
@@ -1626,6 +1889,9 @@ class MainWindow(QMainWindow):
 
     def _on_stitch_done(self, ok, failed, out_dir):
         self.progress_bar.hide()
+        self._set_actions_enabled(True)
+        if hasattr(self, "btn_stitch_raw"):
+            self.btn_stitch_raw.setEnabled(True)
         warn = getattr(self._stitch_worker, "warnings", []) or []
         msg = f"Stitched {ok} well(s) into {out_dir}"
         if failed:
@@ -1633,14 +1899,24 @@ class MainWindow(QMainWindow):
         if warn:
             msg += f" — {len(warn)} warning(s)"
         self.statusBar().showMessage(msg)
+        box = QMessageBox(self)
+        box.setStyleSheet("")
+        box.setWindowTitle("スティッチング完了" if ok else "スティッチング失敗")
+        box.setIcon(QMessageBox.Icon.Information if ok else QMessageBox.Icon.Critical)
+        body = (f"{ok} ウェルを書き出しました。\n出力先: {out_dir}"
+                if ok else f"書き出せたウェルがありません。\n出力先: {out_dir}")
+        if failed:
+            body += f"\n失敗: {failed} ウェル"
         if warn:
-            QMessageBox.warning(
-                self, "Stitching finished with warnings",
-                f"{ok} well(s) written to:\n{out_dir}\n\n" +
-                "\n".join(warn[:12]) +
-                ("\n…" if len(warn) > 12 else "") +
-                "\n\n“alignment uncertain” means the tiles overlapped too little "
-                "(or were too featureless) to measure reliably — check those wells.")
+            body += "\n\n" + "\n".join(warn[:12]) + ("\n…" if len(warn) > 12 else "")
+            body += ("\n\n「alignment uncertain」は重なりが小さすぎるか特徴が乏しく"
+                     "測定できなかったことを示します — 該当ウェルを確認してください。")
+        box.setText(body)
+        open_btn = box.addButton("出力フォルダを開く", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("閉じる", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out_dir)))
 
     # ---------- plate contact-sheet PDF ----------
     @staticmethod
@@ -2024,11 +2300,143 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"PDF export failed: {e}")
 
 
+class StartModeDialog(QDialog):
+    """Which of the two workflows to start in.
+
+    The two paths need different discovery: a `.ktf` experiment has the mosaics
+    already, a raw capture folder has only per-field tiles. Inferring the mode
+    from a folder was the old behaviour and it silently hid raw folders, so the
+    choice is explicit.
+    """
+
+    KTF, RAW = "ktf", "raw"
+
+    def __init__(self, parent=None, last_ktf="", last_raw=""):
+        super().__init__(parent)
+        self.setWindowTitle("KTF Viewer — start")
+        self.setMinimumWidth(560)
+        self.choice = None
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        head = QLabel("<b>どちらから始めますか？</b>")
+        lay.addWidget(head)
+
+        for mode, title, desc, last, btn_text in [
+            (self.KTF, ".ktf から始める（貼り合わせ済み）",
+             "顕微鏡が出力した .ktf のモザイクを開いて表示・書き出します。", last_ktf,
+             ".ktf フォルダを選ぶ…"),
+            (self.RAW, "生画像から始める（未貼り合わせ）",
+             "各視野の X###Y### タイルを読み込み、貼り合わせ（スティッチング）します。",
+             last_raw, "生画像フォルダを選ぶ…"),
+        ]:
+            box = QGroupBox(title)
+            v = QVBoxLayout(box)
+            d = QLabel(desc)
+            d.setWordWrap(True)
+            d.setStyleSheet("color:#bbb;")
+            v.addWidget(d)
+            if last:
+                p = QLabel(f"前回: {last}")
+                p.setStyleSheet("color:#888; font-size:10px;")
+                p.setWordWrap(True)
+                v.addWidget(p)
+            b = QPushButton(btn_text)
+            b.clicked.connect(lambda _, m=mode: self._pick(m))
+            v.addWidget(b)
+            lay.addWidget(box)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _pick(self, mode):
+        self.choice = mode
+        self.accept()
+
+
+class ScanWorker(QThread):
+    """Finds candidate experiments off the GUI thread (a drive root can be huge)."""
+
+    progress = pyqtSignal(str, int)      # current dir, dirs examined
+    finished_scan = pyqtSignal(object, int)   # list[Path], unreadable-dir count
+
+    def __init__(self, root: Path, mode: str):
+        super().__init__()
+        self.root = Path(root)
+        self.mode = mode
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        found, seen, errors = [], 0, 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(self.root, onerror=lambda e: None):
+                if self._cancel:
+                    self.finished_scan.emit(None, errors)   # None = cancelled
+                    return
+                seen += 1
+                if seen % 250 == 0:
+                    self.progress.emit(dirpath, seen)
+                d = Path(dirpath)
+                if self.mode == StartModeDialog.KTF:
+                    if any(ktf_reader.is_ktf_file(Path(f)) for f in filenames):
+                        found.append(d)
+                        dirnames[:] = []
+                else:
+                    if _is_raw_experiment(d, dirnames):
+                        found.append(d)
+                        dirnames[:] = []      # its wells/fields are not experiments
+        except Exception:
+            errors += 1
+        self.finished_scan.emit(sorted(found), errors)
+
+
+def _raw_wells_of(folder: Path) -> list:
+    """Well folders directly under `folder` that hold X###Y### tile files.
+
+    Purely structural — it never opens a TIFF, so scanning a whole drive stays
+    cheap. `.ici` / `.ibc2` / `.gci` never qualify an experiment on their own.
+    """
+    wells = []
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return wells
+    for well in entries:
+        if not well.is_dir() or well.name.startswith("._"):
+            continue
+        try:
+            positions = list(well.iterdir())
+        except OSError:
+            continue
+        for pos in positions:
+            if not pos.is_dir() or not stitcher.POS_RE.fullmatch(pos.name):
+                continue
+            try:
+                hit = any(f.is_file() and not f.name.startswith("._")
+                          and stitcher.TILE_RE.search(f.name)
+                          for f in pos.iterdir())
+            except OSError:
+                continue
+            if hit:                       # one proven tile is enough
+                wells.append(well.name)
+                break
+    return sorted(wells)
+
+
+def _is_raw_experiment(folder: Path, dirnames=None) -> bool:
+    return bool(_raw_wells_of(folder))
+
+
 class StitchDialog(QDialog):
     """Options for rebuilding whole-well mosaics from the raw BZ-X tiles."""
 
-    def __init__(self, wells, parent=None):
+    def __init__(self, wells, parent=None, current_well=None):
         super().__init__(parent)
+        self._current_well = current_well
         self.setWindowTitle("Stitch raw tiles")
         self.setMinimumWidth(460)
         lay = QVBoxLayout(self)
@@ -2047,7 +2455,9 @@ class StitchDialog(QDialog):
         r = 0
         form.addWidget(QLabel("Wells:"), r, 0)
         self.cmb_wells = QComboBox()
-        self.cmb_wells.addItems([f"All wells ({len(wells)})", "Current well only"])
+        self.cmb_wells.addItem(f"All wells ({len(wells)})")
+        if current_well:
+            self.cmb_wells.addItem(f"Selected well only ({current_well})")
         form.addWidget(self.cmb_wells, r, 1); r += 1
 
         if n_z > 1:
@@ -2332,10 +2742,8 @@ def main():
     _install_excepthook()
     window = MainWindow()
     window.show()
-    # Reopen the folder from last session, if it still exists (cross-platform).
-    last = QSettings().value("last_root", "")
-    if last and Path(last).is_dir():
-        window._scan_root(Path(last))
+    # Always ask which workflow to start in; the two paths need different discovery.
+    QTimer.singleShot(0, window._show_start_chooser)
     sys.exit(app.exec())
 
 
