@@ -7,5 +7,5 @@ mirrored in the packaging metadata. Semantic versioning — MAJOR.MINOR.PATCH:
   PATCH  ordinary updates: fixes and small improvements (the usual bump)
 """
 
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 APP_NAME = "BZ Plate Studio"

@@ -970,7 +970,7 @@ class MainWindow(QMainWindow):
         b_clear.clicked.connect(self._clear_conditions)
         cond_btns.addWidget(b_clear)
         cond_btns.addStretch()
-        b_csv = QPushButton("Export CSV")
+        b_csv = QPushButton("Export CSV…")
         b_csv.clicked.connect(self._export_conditions_csv)
         cond_btns.addWidget(b_csv)
         ct.addLayout(cond_btns)
@@ -1028,13 +1028,13 @@ class MainWindow(QMainWindow):
 
         export_group = QGroupBox("Export")
         eg = QVBoxLayout(export_group)
-        b1 = QPushButton("Export PNG (view)")
+        b1 = QPushButton("Export PNG (view)…")
         b1.clicked.connect(lambda: self._export("png"))
-        b2 = QPushButton("Export TIFF (full res)")
+        b2 = QPushButton("Export TIFF (full res)…")
         b2.clicked.connect(lambda: self._export("tiff"))
-        b3 = QPushButton("Export All Wells (TIFF)")
+        b3 = QPushButton("Export All Wells (TIFF)…")
         b3.clicked.connect(self._export_all_wells)
-        b4 = QPushButton("Export Plate to PDF")
+        b4 = QPushButton("Export Plate to PDF…")
         b4.setToolTip("All wells arranged as a contact sheet in one PDF (quality selectable)")
         b4.clicked.connect(self._export_plate_pdf)
         # Stitching belongs to the raw workflow only — it lives in the raw panel.
@@ -1203,6 +1203,14 @@ class MainWindow(QMainWindow):
         if mode == StartModeDialog.KTF:
             return s.value("last_ktf_root", "") or s.value("last_root", "") or ""
         return s.value("last_raw_root", "") or ""
+
+    def _last_export_dir(self) -> str:
+        """Where the previous export went, so Save-As opens somewhere useful."""
+        d = QSettings().value("last_export_dir", "") or ""
+        return d if d and Path(d).is_dir() else str(Path.home())
+
+    def _remember_export_dir(self, folder: Path):
+        QSettings().setValue("last_export_dir", str(folder))
 
     def _show_start_chooser(self):
         if self._busy:
@@ -1617,9 +1625,9 @@ class MainWindow(QMainWindow):
         exp = self._active_experiment()
         if not exp:
             return
-        default = f"{exp['name']}_conditions.csv"
-        path, _ = QFileDialog.getSaveFileName(self, "Export conditions CSV", default, "CSV (*.csv)")
-        if not path:
+        default = f"{_safe_base_name(exp['name'])}_conditions.csv"
+        path = _ask_save_path(self, "サンプル条件を名前を付けて保存", default, "CSV (*.csv)")
+        if path is None:
             return
         t = self.conditions
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -1852,9 +1860,13 @@ class MainWindow(QMainWindow):
             if not self._current_well or self._current_well not in wells:
                 self.statusBar().showMessage("Select a well first.")
                 return
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Export TIFF", f"{self._current_well}.tif", "TIFF (*.tif)")
-            if not path:
+            channels = list(wells[self._current_well])
+            # One file per channel is written, not the name typed into the dialog —
+            # so the overwrite check has to be made against those names.
+            path = _ask_save_path(
+                self, "TIFF を名前を付けて保存", f"{self._current_well}.tif", "TIFF (*.tif)",
+                derived=lambda p: [p.with_name(f"{p.stem}_{c}.tif") for c in channels])
+            if path is None:
                 return
             self.statusBar().showMessage("Exporting full-resolution TIFF per channel...")
             self._exporting = True
@@ -1862,9 +1874,9 @@ class MainWindow(QMainWindow):
             try:
                 for ch_id, info in wells[self._current_well].items():
                     img = ktf_reader.reconstruct_image(info.path, downsample=1)
-                    out = Path(path).with_name(f"{Path(path).stem}_{ch_id}.tif")
+                    out = path.with_name(f"{path.stem}_{ch_id}.tif")
                     Image.fromarray(img).save(str(out))
-                self.statusBar().showMessage(f"Exported full-res channels to {Path(path).parent}")
+                self.statusBar().showMessage(f"Exported full-res channels to {path.parent}")
             except Exception as e:
                 self.statusBar().showMessage(f"TIFF export failed: {e}")
             finally:
@@ -1872,10 +1884,11 @@ class MainWindow(QMainWindow):
         else:
             if not hasattr(self, "_channel_images") or not self._channel_images:
                 return
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Export PNG", f"{self._current_well}.png", "PNG (*.png)")
-            if not path:
+            path = _ask_save_path(self, "PNG を名前を付けて保存",
+                                  f"{self._current_well}.png", "PNG (*.png)")
+            if path is None:
                 return
+            path = str(path)
             max_h = max(i.shape[0] for i in self._channel_images.values())
             max_w = max(i.shape[1] for i in self._channel_images.values())
             aligned = {c: (i if i.shape[:2] == (max_h, max_w)
@@ -1888,16 +1901,19 @@ class MainWindow(QMainWindow):
     def _export_all_wells(self):
         if not self._experiment or self._busy:
             return
-        folder = QFileDialog.getExistingDirectory(self, "Select Export Folder")
-        if not folder:
+        wells = self._experiment["wells"]
+        dlg = OutputTargetDialog(
+            self, "すべてのウェルを名前を付けて保存",
+            self._experiment["name"], "{base}_A01_CH1.tif", self._last_export_dir())
+        dlg.setStyleSheet("")
+        if not dlg.exec():
             return
-        problem = _writable_problem(Path(folder))
-        if problem:
-            QMessageBox.critical(self, "この場所には保存できません", problem)
+        out, base = dlg.folder, dlg.base
+        self._remember_export_dir(dlg.root)
+        if not _confirm_overwrite(self, [out / f"{base}_{wid}_{ch}.tif"
+                                         for wid, chans in wells.items() for ch in chans]):
             return
         self._exporting = True
-        out = Path(folder)
-        wells = self._experiment["wells"]
         total = sum(len(c) for c in wells.values())
         done = 0
         self.progress_bar.setRange(0, total)
@@ -1911,7 +1927,7 @@ class MainWindow(QMainWindow):
                     QApplication.processEvents()
                     try:
                         img = ktf_reader.reconstruct_image(info.path, downsample=1)
-                        Image.fromarray(img).save(str(out / f"{wid}_{ch_id}.tif"))
+                        Image.fromarray(img).save(str(out / f"{base}_{wid}_{ch_id}.tif"))
                     except Exception as e:
                         failed += 1
                         print(f"Export error {wid}/{ch_id}: {e}")
@@ -1920,7 +1936,7 @@ class MainWindow(QMainWindow):
         finally:
             self._exporting = False
             self.progress_bar.hide()
-        msg = f"Exported {done - failed}/{total} images to {folder}"
+        msg = f"Exported {done - failed}/{total} images to {out}"
         self.statusBar().showMessage(msg + (f" — {failed} failed" if failed else ""))
 
     # ---------- busy state ----------
@@ -1968,12 +1984,20 @@ class MainWindow(QMainWindow):
                 return
             wells = {wid: wells[wid]}
 
-        out = QFileDialog.getExistingDirectory(self, "Save stitched images to")
-        if not out:
+        default_base = self._raw_experiment["name"]
+        if not dlg.all_wells:
+            default_base = f"{default_base}_{next(iter(wells))}"
+        tgt = OutputTargetDialog(
+            self, "貼り合わせた画像を名前を付けて保存", default_base,
+            StitchWorker.SAMPLE_NAME.get(dlg.fmt, "{base}_A01.tif"),
+            self._last_export_dir())
+        tgt.setStyleSheet("")
+        if not tgt.exec():
             return
-        problem = _writable_problem(Path(out))
-        if problem:
-            QMessageBox.critical(self, "この場所には保存できません", problem)
+        out, base = tgt.folder, tgt.base
+        self._remember_export_dir(tgt.root)
+        if not _confirm_overwrite(
+                self, StitchWorker.planned_outputs(out, base, sorted(wells), dlg.fmt)):
             return
 
         self._set_actions_enabled(False)
@@ -1986,7 +2010,7 @@ class MainWindow(QMainWindow):
         self._stitch_worker = StitchWorker(
             wells, out, dlg.z_mode, dlg.fmt,
             flatfield=dlg.flatfield, subpixel=dlg.subpixel,
-            exp_name=self._raw_experiment["name"],
+            exp_name=self._raw_experiment["name"], base=base,
             conditions=cond, cond_headers=headers)
         self._stitch_worker.progress.connect(self._on_stitch_progress)
         self._stitch_worker.done.connect(self._on_stitch_done)
@@ -2237,10 +2261,12 @@ class MainWindow(QMainWindow):
         choice = dlg.textValue()
         source, panel, dpi, layout = self.PDF_QUALITY[choice]
 
-        default_name = f"{self._experiment['name']}_plate.pdf"
-        path, _ = QFileDialog.getSaveFileName(self, "Export Plate to PDF", default_name, "PDF (*.pdf)")
-        if not path:
+        default_name = f"{_safe_base_name(self._experiment['name'])}_plate.pdf"
+        path = _ask_save_path(self, "プレート PDF を名前を付けて保存",
+                              default_name, "PDF (*.pdf)")
+        if path is None:
             return
+        path = str(path)
 
         settings = {c: ctrl.to_view() for c, ctrl in self._channel_controls.items()}
         exp_name = self._experiment["name"]      # snapshot: processEvents() runs below
@@ -2589,6 +2615,203 @@ def _draw_caption_static(canvas, draw, x, y, wid, lines, f_id, f_txt, inset, max
         ty += lh + gap
 
 
+_ILLEGAL_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                 *(f"COM{i}" for i in range(1, 10)),
+                 *(f"LPT{i}" for i in range(1, 10))}
+
+
+def _safe_base_name(text: str) -> str:
+    """A filename fragment that is legal on both macOS and Windows ("" if nothing left).
+
+    The name is typed by the user, so it has to survive a colon or a slash without
+    silently landing in a different directory.
+    """
+    s = _ILLEGAL_NAME.sub("_", (text or "").strip())
+    s = s.strip(" .")                    # Windows drops trailing dots and spaces
+    if s.upper() in _WIN_RESERVED:
+        s += "_"
+    return s[:80]
+
+
+def _confirm_overwrite(parent, paths, title="上書きの確認") -> bool:
+    """Ask before replacing files that already exist. False = the user cancelled.
+
+    QFileDialog only guards the one name typed into it. Every export here writes
+    something it never sees — an appended extension, one file per channel, a whole
+    folder of per-well files — so a second run used to replace the first with no
+    warning at all.
+    """
+    seen, existing = set(), []
+    for p in paths:
+        p = Path(p)
+        if p in seen:
+            continue
+        seen.add(p)
+        try:
+            if p.exists():
+                existing.append(p)
+        except OSError:
+            pass
+    if not existing:
+        return True
+    shown = "\n".join(f"　• {p.name}" for p in existing[:12])
+    if len(existing) > 12:
+        shown += f"\n　…ほか {len(existing) - 12} 件"
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle(title)
+    box.setText(f"同じ名前のファイルが {len(existing)} 個あります。上書きしますか？")
+    box.setInformativeText(
+        f"保存先: {existing[0].parent}\n\n"
+        f"次のファイルが置き換えられます（元に戻せません）:\n{shown}")
+    ow = box.addButton("上書きする", QMessageBox.ButtonRole.DestructiveRole)
+    cancel = box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(cancel)         # safe default: Return must not destroy data
+    box.setEscapeButton(cancel)
+    box.exec()
+    return box.clickedButton() is ow
+
+
+def _ask_save_path(parent, title, default_name, filt, derived=None):
+    """Save-As whose overwrite check covers the files actually written. None = cancelled.
+
+    Two holes the plain dialog leaves open:
+      * the extension is appended *after* Qt's check, so typing `plate` where
+        `plate.pdf` already existed was accepted and then replaced it silently;
+      * the TIFF export writes `<name>_<channel>.tif` — files Qt never sees.
+    `derived(path)` returns the real list of files for the chosen name.
+    """
+    want = Path(default_name).suffix
+    start = default_name
+    while True:
+        chosen, _ = QFileDialog.getSaveFileName(parent, title, start, filt)
+        if not chosen:
+            return None
+        path = Path(chosen)
+        if want and path.suffix.lower() != want.lower():
+            path = path.with_name(path.name + want)
+        targets = list(derived(path)) if derived else [path]
+        # Qt already confirmed the one name the user typed; only ask about the rest.
+        targets = [p for p in targets if Path(p) != Path(chosen)]
+        if _confirm_overwrite(parent, targets):
+            return path
+        start = str(path)                # reopen in the same folder, name preselected
+
+
+class OutputTargetDialog(QDialog):
+    """Where a multi-file export goes, and what its files are called.
+
+    Picking only a folder gave the user no say in the filenames and quietly
+    replaced the previous run. Here the name is typed like any “Save As”, and a
+    folder of its own (on by default) keeps two runs from landing on top of each
+    other.
+    """
+
+    def __init__(self, parent, title, default_base, sample, start_dir=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(600)
+        self._sample = sample            # e.g. "{base}_A01.ome.tif"
+        lay = QVBoxLayout(self)
+
+        form = QGridLayout()
+        form.addWidget(QLabel("保存先:"), 0, 0)
+        self.ed_folder = QLineEdit(start_dir)
+        self.ed_folder.setPlaceholderText("保存先のフォルダ")
+        form.addWidget(self.ed_folder, 0, 1)
+        btn = QPushButton("参照…")
+        btn.clicked.connect(self._browse)
+        form.addWidget(btn, 0, 2)
+
+        form.addWidget(QLabel("名前:"), 1, 0)
+        self.ed_name = QLineEdit(_safe_base_name(default_base))
+        self.ed_name.setPlaceholderText("ファイル名（この名前で始まる名前で保存されます）")
+        form.addWidget(self.ed_name, 1, 1, 1, 2)
+        form.setColumnStretch(1, 1)
+        lay.addLayout(form)
+
+        self.chk_sub = QCheckBox("この名前のフォルダを作って、その中に保存する")
+        self.chk_sub.setChecked(True)
+        self.chk_sub.setToolTip(
+            "書き出すたびに専用のフォルダができるので、前回の結果を上書きしません。")
+        lay.addWidget(self.chk_sub)
+
+        self.lbl_preview = QLabel()
+        self.lbl_preview.setWordWrap(True)
+        self.lbl_preview.setStyleSheet("color:#6b7280; font-size:11px;")
+        lay.addWidget(self.lbl_preview)
+
+        self.box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
+                                    QDialogButtonBox.StandardButton.Cancel)
+        self.box.button(QDialogButtonBox.StandardButton.Save).setText("この名前で保存")
+        self.box.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
+        self.box.accepted.connect(self._accept)
+        self.box.rejected.connect(self.reject)
+        lay.addWidget(self.box)
+
+        self.ed_folder.textChanged.connect(self._refresh)
+        self.ed_name.textChanged.connect(self._refresh)
+        self.chk_sub.toggled.connect(self._refresh)
+        self._refresh()
+        self.ed_name.setFocus()
+        self.ed_name.selectAll()
+
+    # ---- chosen target ----
+    @property
+    def base(self) -> str:
+        return _safe_base_name(self.ed_name.text())
+
+    @property
+    def root(self) -> Path:
+        """The folder the user browsed to (without the per-run subfolder)."""
+        return Path(self.ed_folder.text().strip()).expanduser()
+
+    @property
+    def folder(self) -> Path:
+        return self.root / self.base if self.chk_sub.isChecked() else self.root
+
+    # ---- ui ----
+    def _browse(self):
+        start = self.ed_folder.text().strip()
+        if not Path(start or "/").is_dir():
+            start = str(Path.home())
+        f = QFileDialog.getExistingDirectory(self, "保存先フォルダを選ぶ", start)
+        if f:
+            self.ed_folder.setText(f)
+
+    def _refresh(self):
+        base, root = self.base, self.ed_folder.text().strip()
+        ok = bool(base) and bool(root)
+        self.box.button(QDialogButtonBox.StandardButton.Save).setEnabled(ok)
+        if not ok:
+            self.lbl_preview.setText("保存先フォルダと名前を入力してください。")
+            return
+        self.lbl_preview.setText(
+            f"保存例:　{self.folder / self._sample.format(base=base)}")
+
+    def _accept(self):
+        root = self.root
+        if not root.is_dir():
+            QMessageBox.warning(self, "保存先がありません",
+                                f"“{root}” は存在しないか、フォルダではありません。")
+            return
+        problem = _writable_problem(root)
+        if problem:
+            QMessageBox.critical(self, "この場所には保存できません", problem)
+            return
+        out = self.folder
+        if out != root:
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                QMessageBox.critical(
+                    self, "フォルダを作成できません",
+                    f"“{out}” を作成できませんでした（{e.strerror or e}）。")
+                return
+        self.accept()
+
+
 def _writable_problem(folder: Path) -> str:
     """Plain-language reason this folder cannot receive output, or "" if it can.
 
@@ -2774,7 +2997,7 @@ class StitchDialog(QDialog):
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                QDialogButtonBox.StandardButton.Cancel)
-        box.button(QDialogButtonBox.StandardButton.Ok).setText("Choose folder…")
+        box.button(QDialogButtonBox.StandardButton.Ok).setText("保存先と名前を指定…")
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         lay.addWidget(box)
@@ -2809,10 +3032,51 @@ class StitchWorker(QThread):
     progress = pyqtSignal(str, float)          # message, 0..1
     done = pyqtSignal(int, int, str)           # ok, failed, out_dir
 
+    #: what one output file looks like, per format — shown in the Save-As preview
+    SAMPLE_NAME = {
+        "both": "{base}_A01.ome.tif",
+        "ometiff": "{base}_A01.ome.tif",
+        "png": "{base}_A01.png",
+        "split": "{base}_A01_CH1.tif",
+        "pdf_pages": "{base}_A01.pdf",
+        "pdf_sheet": "{base}_plate.pdf",
+        "pdf_sheet_pages": "{base}_plate_and_wells.pdf",
+        "ometiff_pdf": "{base}_A01.ome.tif",
+    }
+
+    @staticmethod
+    def planned_outputs(out: Path, base: str, wids, fmt) -> list:
+        """Every file this run will write, so nothing is replaced without asking.
+
+        Kept next to `_write`, which is the only place these names are produced —
+        the two must agree or the warning silently misses files.
+        """
+        out, paths = Path(out), []
+        for wid in wids:
+            if fmt in ("ometiff", "both", "ometiff_pdf"):
+                paths.append(out / f"{base}_{wid}.ome.tif")
+            if fmt in ("png", "both"):
+                paths.append(out / f"{base}_{wid}.png")
+            if fmt == "pdf_pages":
+                paths.append(out / f"{base}_{wid}.pdf")
+            if fmt == "split":
+                # channel labels are only known after stitching, so match on the stem
+                try:
+                    paths += sorted(out.glob(f"{base}_{wid}_*.tif"))
+                except OSError:
+                    pass
+        if fmt in ("pdf_sheet", "ometiff_pdf"):
+            paths.append(out / f"{base}_plate.pdf")
+        if fmt == "pdf_sheet_pages":
+            paths.append(out / f"{base}_plate_and_wells.pdf")
+        paths.append(out / f"{base}_stitch_qc.csv")
+        return paths
+
     def __init__(self, wells, out_dir, z_mode, fmt, flatfield=True, subpixel=True,
-                 exp_name="experiment", conditions=None, cond_headers=None):
+                 exp_name="experiment", base="", conditions=None, cond_headers=None):
         super().__init__()
         self.exp_name = exp_name
+        self.base = _safe_base_name(base) or _safe_base_name(exp_name) or "stitched"
         self._cond = conditions or {}
         self._cond_headers = cond_headers or []
         self.sheet_panels = {}
@@ -2956,7 +3220,7 @@ class StitchWorker(QThread):
                 "ambiguous_edges", "flatfield", "low_confidence",
                 "width", "height"]
         try:
-            with open(self.out_dir / "stitch_qc.csv", "w", newline="",
+            with open(self.out_dir / f"{self.base}_stitch_qc.csv", "w", newline="",
                       encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 w.writerow(cols)
@@ -2996,16 +3260,19 @@ class StitchWorker(QThread):
     def _write(self, wid, wt, res):
         planes_data = [(p, img) for (p, img) in res.values()]
         pixel_um = stitcher.tile_pixel_um(wt)
+        # Names must stay in step with planned_outputs(), which is what the user
+        # was shown and agreed to overwrite.
         if self.fmt in ("ometiff", "both", "ometiff_pdf"):
-            stitcher.save_ome_tiff(self.out_dir / f"{wid}.ome.tif", planes_data, pixel_um)
+            stitcher.save_ome_tiff(
+                self.out_dir / f"{self.base}_{wid}.ome.tif", planes_data, pixel_um)
         if self.fmt == "split":
             for p, img in planes_data:
-                Image.fromarray(img).save(self.out_dir / f"{wid}_{p.label}.tif")
+                Image.fromarray(img).save(self.out_dir / f"{self.base}_{wid}_{p.label}.tif")
         if self.fmt in ("png", "both"):
-            self._composite(planes_data).save(self.out_dir / f"{wid}.png")
+            self._composite(planes_data).save(self.out_dir / f"{self.base}_{wid}.png")
         if self.fmt == "pdf_pages":
             im = self._composite(planes_data)
-            self._label_and_save_pdf(im, wid, self.out_dir / f"{wid}.pdf")
+            self._label_and_save_pdf(im, wid, self.out_dir / f"{self.base}_{wid}.pdf")
         if self.fmt == "pdf_sheet_pages":
             # a page per well, appended after the overview sheet in ONE document
             self.well_pages.append((wid, self._page_for(self._composite(planes_data), wid)))
@@ -3080,8 +3347,8 @@ class StitchWorker(QThread):
                                      self.conditions_for(wid), f_lbl, f_cond,
                                      max(4, int(6 * k)), cw - int(12 * k))
         extra = [pg for _, pg in self.well_pages]
-        name = (f"{self.exp_name}_plate_and_wells.pdf" if extra
-                else f"{self.exp_name}_plate.pdf")
+        name = (f"{self.base}_plate_and_wells.pdf" if extra
+                else f"{self.base}_plate.pdf")
         path = self.out_dir / name
         tmp = Path(str(path) + ".part")
         sheet.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0,
