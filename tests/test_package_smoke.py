@@ -15,6 +15,8 @@ class PackageSmokeTests(unittest.TestCase):
             self.assertEqual(main._run_package_smoke(output), 0)
             report = json.loads((output / "package-smoke.json").read_text("utf-8"))
             self.assertTrue(report["ok"])
+            self.assertEqual(report["qt_binding"], "PySide6")
+            self.assertTrue(report["qt_binding_version"])
             self.assertEqual(report["shape"], [2, 64, 80])
             self.assertTrue((output / report["lzw"]).is_file())
             self.assertTrue((output / report["ome"]).is_file())

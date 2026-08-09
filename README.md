@@ -80,7 +80,7 @@ Python 3.9以上が必要です。
 ## ビルド
 
 ```bash
-pip install -r requirements.txt pyinstaller
+pip install -r requirements-dev.txt
 pyinstaller --noconfirm ktf_viewer.spec
 ```
 
@@ -93,3 +93,5 @@ pyinstaller --noconfirm ktf_viewer.spec
 
 研究目的での利用、論文・発表への出力画像の使用、自分の利用範囲での改変ができます。
 再配布、ミラーリング、派生物の公開、第三者へのホスティングには事前の許可が必要です。
+GUIにはLGPLv3のPySide6/Qtを使用しています。第三者ライセンス、対応ソース、ライブラリの
+交換方法は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)を参照してください。

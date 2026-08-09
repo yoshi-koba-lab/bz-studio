@@ -13,15 +13,16 @@ import json
 import math
 from pathlib import Path
 
-# Make the app self-contained when run from source: point Qt at PyQt6's bundled
+# Make the app self-contained when run from source: point Qt at PySide6's bundled
 # platform plugins. Some Python environments (e.g. non-activated conda) don't set
 # this, causing a "could not find the Qt platform plugin" crash on launch.
 # Skip entirely when frozen (PyInstaller) — it configures Qt itself, and overriding
 # the path there breaks plugin discovery.
 if not getattr(sys, "frozen", False):
     try:
-        import PyQt6
-        _plugins = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "plugins", "platforms")
+        from PySide6.QtCore import QLibraryInfo
+        _plugins = os.path.join(
+            QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath), "platforms")
         if os.path.isdir(_plugins):
             os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", _plugins)
     except Exception:
@@ -35,7 +36,7 @@ from PIL import Image, ImageDraw, ImageFont
 # Contact sheets at original resolution legitimately exceed PIL's bomb threshold.
 Image.MAX_IMAGE_PIXELS = None
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTreeWidget, QTreeWidgetItem, QLabel, QScrollArea,
     QSlider, QGroupBox, QCheckBox, QPushButton, QToolButton,
@@ -45,11 +46,11 @@ from PyQt6.QtWidgets import (
     QProxyStyle, QStyle, QDialogButtonBox, QDialog, QComboBox, QDockWidget,
     QHeaderView,
 )
-from PyQt6.QtCore import (
-    Qt, QSize, QSizeF, QMarginsF, pyqtSignal, QPoint, QRect, QThread, QTimer,
+from PySide6.QtCore import (
+    Qt, QSize, QSizeF, QMarginsF, Signal, QPoint, QRect, QThread, QTimer,
     QPointF, QEvent, QSettings, QUrl, QSaveFile, QIODevice,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QImage, QPixmap, QIcon, QPainter, QColor, QAction, QWheelEvent,
     QMouseEvent, QPen, QFont, QKeySequence, QBrush, QDesktopServices,
     QPdfWriter, QPageSize, QPageLayout,
@@ -115,8 +116,8 @@ def numpy_to_qpixmap(arr: np.ndarray) -> QPixmap:
 class ImageCanvas(QWidget):
     """Zoomable/pannable canvas with scale bar, cursor readout, and detail overlay."""
 
-    view_changed = pyqtSignal()          # emitted after zoom/pan settles (debounced)
-    cursor_moved = pyqtSignal(float, float)  # full-res image coords under cursor
+    view_changed = Signal()          # emitted after zoom/pan settles (debounced)
+    cursor_moved = Signal(float, float)  # full-res image coords under cursor
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -497,7 +498,7 @@ class ImageCanvas(QWidget):
 
 class DetailWorker(QThread):
     """Loads a full-res region composite for the current viewport."""
-    ready = pyqtSignal(object, object, int)  # QImage, (x0,y0,w,h), generation
+    ready = Signal(object, object, int)  # QImage, (x0,y0,w,h), generation
 
     def __init__(self, channel_paths, channel_views, full_dims, rect_full, detail_ds, gen):
         super().__init__()
@@ -544,7 +545,10 @@ class DetailWorker(QThread):
 
 
 class LoadWorker(QThread):
-    finished = pyqtSignal(str, object, int)  # ch_id, image, generation
+    # Keep QThread.finished() available as the no-argument lifecycle signal.
+    # PySide exposes inherited C++ signals strictly, so use a separate payload
+    # signal instead of shadowing it with an incompatible signature.
+    loaded = Signal(str, object, int)  # ch_id, image, generation
 
     def __init__(self, path, ch_id, downsample=1, gen=0):
         super().__init__()
@@ -556,14 +560,14 @@ class LoadWorker(QThread):
     def run(self):
         try:
             img = ktf_reader.reconstruct_image(self.path, downsample=self.downsample)
-            self.finished.emit(self.ch_id, img, self.gen)
+            self.loaded.emit(self.ch_id, img, self.gen)
         except Exception as e:
             print(f"Error loading {self.path}: {e}")
-            self.finished.emit(self.ch_id, None, self.gen)
+            self.loaded.emit(self.ch_id, None, self.gen)
 
 
 class ChannelControl(QWidget):
-    changed = pyqtSignal()
+    changed = Signal()
 
     def __init__(self, ch_id, display_name, color, parent=None):
         super().__init__(parent)
@@ -649,7 +653,7 @@ class ChannelControl(QWidget):
 
 
 class WellPlateWidget(QWidget):
-    well_clicked = pyqtSignal(str)
+    well_clicked = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -757,7 +761,7 @@ class WellConditionsTable(QTableWidget):
     - Edits are reported via `edited` so the host can persist them.
     """
 
-    edited = pyqtSignal()
+    edited = Signal()
     DEFAULT_HEADERS = ["Well", "Sample", "Treatment", "Conc.", "Time", "Notes"]
 
     def __init__(self, parent=None):
@@ -1332,6 +1336,12 @@ class MainWindow(QMainWindow):
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
             "広範囲モザイク／プレート画像／.ktf ビューア<br>"
             "&copy; 2026 yoshi-koba-lab — All Rights Reserved.<br><br>"
+            "UI: PySide6 6.10.3 / Qt 6.10.3<br>"
+            "Qt for Python and Qt &copy; The Qt Company Ltd. and contributors; "
+            "provided under LGPLv3.<br>"
+            "Complete license texts, notices and replacement instructions are included "
+            "in <code>THIRD_PARTY_NOTICES.md</code> and <code>licenses/</code>.<br>"
+            "<a href='https://doc.qt.io/qtforpython-6/'>Qt for Python</a><br><br>"
             "<a href='https://github.com/yoshi-koba-lab/bz-plate-studio'>"
             "github.com/yoshi-koba-lab/bz-plate-studio</a>")
 
@@ -2117,7 +2127,7 @@ class MainWindow(QMainWindow):
             self._channel_controls[ch_id] = ctrl
             self.channel_layout.insertWidget(self.channel_layout.count() - 1, ctrl)
             w = LoadWorker(info.path, ch_id, downsample=ds, gen=self._gen)
-            w.finished.connect(self._on_channel_loaded)
+            w.loaded.connect(self._on_channel_loaded)
             self._workers.append(w)
             w.start()
 
@@ -3462,7 +3472,7 @@ def _newer(remote: str, local: str) -> bool:
 class UpdateChecker(QThread):
     """Asks GitHub for the newest release. Silent on any failure."""
 
-    found = pyqtSignal(str, str)     # version, html_url
+    found = Signal(str, str)     # version, html_url
 
     def run(self):
         import json as _json
@@ -3566,8 +3576,8 @@ class StartModeDialog(QDialog):
 class ScanWorker(QThread):
     """Finds candidate experiments off the GUI thread (a drive root can be huge)."""
 
-    progress = pyqtSignal(str, int)      # current dir, dirs examined
-    finished_scan = pyqtSignal(object, int)   # list[Path], unreadable-dir count
+    progress = Signal(str, int)      # current dir, dirs examined
+    finished_scan = Signal(object, int)   # list[Path], unreadable-dir count
 
     def __init__(self, root: Path, mode: str):
         super().__init__()
@@ -3750,9 +3760,9 @@ def _ask_save_path(parent, title, default_name, filt, derived=None):
 class PlateSeriesBuilder(QWidget):
     """Build an ordered PDF series while the main plate viewer stays usable."""
 
-    capture_activated = pyqtSignal(object)
-    conditions_requested = pyqtSignal(object)
-    export_requested = pyqtSignal(object, object)
+    capture_activated = Signal(object)
+    conditions_requested = Signal(object)
+    export_requested = Signal(object, object)
 
     PATH_ROLE = Qt.ItemDataRole.UserRole
     SEARCH_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -4746,8 +4756,8 @@ class StitchDialog(QDialog):
 
 class StitchWorker(QThread):
     """Runs stitching off the GUI thread."""
-    progress = pyqtSignal(str, float)          # message, 0..1
-    done = pyqtSignal(int, int, str)           # ok, failed, out_dir
+    progress = Signal(str, float)          # message, 0..1
+    done = Signal(int, int, str)           # ok, failed, out_dir
 
     #: what one output file looks like, per format — shown in the Save-As preview
     SAMPLE_NAME = {
@@ -5089,10 +5099,9 @@ class LeftAffirmativeStyle(QProxyStyle):
 
 
 def _install_excepthook():
-    """Show unexpected errors instead of letting PyQt abort the process.
+    """Show unexpected errors instead of losing them in a windowed process.
 
-    An uncaught exception inside a Qt slot makes PyQt6 call qFatal(), which kills a
-    windowed (console-less) build with no message at all.
+    A windowed (console-less) build otherwise gives the user no useful traceback.
     """
     import traceback
 
@@ -5120,10 +5129,21 @@ def _run_package_smoke(output_dir: Path) -> int:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "package-smoke.json"
-    report = {"ok": False, "app": APP_NAME, "version": __version__}
+    report = {
+        "ok": False,
+        "app": APP_NAME,
+        "version": __version__,
+        "qt_binding": "PySide6",
+    }
     try:
         import imagecodecs
         import tifffile
+        from PySide6 import QtCore
+
+        if not QtCore.__version__:
+            raise RuntimeError("PySide6 version is unavailable")
+        report["qt_binding_version"] = QtCore.__version__
+        report["qt_version"] = QtCore.qVersion()
 
         source = ((np.arange(64, dtype=np.uint16)[:, None] * 31
                    + np.arange(80, dtype=np.uint16)[None, :] * 17) % 4093)

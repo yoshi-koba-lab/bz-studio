@@ -14,10 +14,10 @@ os.environ["BZPS_TEST"] = "1"
 
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import QSettings
-from PyQt6.QtPdf import QPdfDocument
-from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PySide6.QtCore import QSettings
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
+from pypdf import PdfReader
 
 import ktf_reader
 import main
@@ -304,14 +304,8 @@ class LegacyWorkflowTests(unittest.TestCase):
                 self.assertTrue(payload.startswith(b"%PDF-"))
                 self.assertIn(b"%%EOF", payload[-4096:])
                 self.assertGreater(len(payload), 1000)
-                document = QPdfDocument(None)
-                try:
-                    self.assertEqual(
-                        document.load(str(output)), QPdfDocument.Error.None_,
-                    )
-                    self.assertEqual(document.pageCount(), 2)
-                finally:
-                    document.close()
+                document = PdfReader(str(output))
+                self.assertEqual(len(document.pages), 2)
             finally:
                 self._close_window(window)
 

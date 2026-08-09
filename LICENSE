@@ -40,9 +40,15 @@ Copyright (c) 2026 yoshi-koba-lab. All Rights Reserved.
 利用または同梱しています。本ライセンスは、それら第三者ソフトウェアに対する
 権利には影響しません。主なものは以下のとおりです。
 
-- PyQt6 / Qt — GPL または Qt 社の商用ライセンス
-- NumPy, Pillow, tifffile — 各パッケージの BSD 系ライセンス
+- PySide6 / Shiboken6 / Qt — GNU LGPL version 3
+- NumPy, SciPy, Pillow, tifffile, imagecodecs — 各パッケージのライセンス
 - PyInstaller（ビルド時） — 提供元の条件による
+
+上記の「禁止される行為」は、本ソフトウェア独自部分だけに適用され、第三者
+ソフトウェアのライセンスが認める権利を制限しません。特に、LGPL対象ライブラリの
+改変・交換・再リンク、およびその改変をデバッグするために必要な範囲のリバース
+エンジニアリングを妨げません。詳細、対応ソース、ライブラリ交換方法およびライセンス
+正文は `THIRD_PARTY_NOTICES.md` と同梱の `licenses/` を参照してください。
 
 ### ファイル形式について
 
@@ -88,9 +94,14 @@ another repository, archive, or distribution site; publishing derivative works o
 anything containing a substantial part of the Software; and hosting it as a
 service available to third parties.
 
-**Third-party software** used by the Software (PyQt6/Qt, NumPy, Pillow,
-tifffile, PyInstaller) remains under its own license; this license does not
-affect those rights.
+**Third-party software** used by the Software (PySide6/Shiboken6/Qt, NumPy,
+SciPy, Pillow, tifffile, imagecodecs, and PyInstaller) remains under its own
+license; this license does not affect those rights. The restrictions above
+apply only to BZ Studio's original portions and do not restrict modification,
+replacement, or relinking of LGPL-covered libraries, or reverse engineering
+needed to debug those modifications. See `THIRD_PARTY_NOTICES.md` and the
+bundled `licenses/` directory for source links, replacement instructions, and
+complete LGPL/GPL texts.
 
 **File format.** The Software includes an independent implementation that reads
 the undocumented `.ktf` format written by the Keyence BZ-X, for the sole purpose

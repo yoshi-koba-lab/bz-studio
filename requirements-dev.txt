@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Test/build-only dependencies; none are imported by the shipped application.
+pypdf>=5.0,<7
+pyinstaller>=6.22,<7

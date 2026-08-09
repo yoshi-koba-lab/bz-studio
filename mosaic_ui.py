@@ -15,9 +15,9 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
@@ -42,9 +42,9 @@ DEFAULT_CHANNEL_COLORS = (
 class MosaicMetadataWorker(QThread):
     """Read and validate a GCI/OME image set without blocking the window."""
 
-    progress = pyqtSignal(str, float)
-    ready = pyqtSignal(object)
-    failed = pyqtSignal(str)
+    progress = Signal(str, float)
+    ready = Signal(object)
+    failed = Signal(str)
 
     def __init__(self, folder: Path, parent=None):
         super().__init__(parent)
@@ -72,10 +72,10 @@ class MosaicMetadataWorker(QThread):
 class MosaicBuildWorker(QThread):
     """Register all neighbours and render a bounded interactive preview."""
 
-    progress = pyqtSignal(str, float)
-    ready = pyqtSignal(object, object, int)
-    failed = pyqtSignal(str)
-    cancelled = pyqtSignal()
+    progress = Signal(str, float)
+    ready = Signal(object, object, int)
+    failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, dataset, reference_channel: Optional[str], blend_mode: str,
                  preview_side: int = 4096, parent=None):
@@ -111,7 +111,7 @@ class MosaicBuildWorker(QThread):
 class MosaicDetailWorker(QThread):
     """Render only the currently visible rectangle at the required resolution."""
 
-    ready = pyqtSignal(object, object, int)
+    ready = Signal(object, object, int)
 
     def __init__(self, dataset, geometry, channel_views, blend_mode: str,
                  rect_full, downsample: int, generation: int, parent=None):
@@ -153,10 +153,10 @@ class MosaicDetailWorker(QThread):
 class MosaicExportWorker(QThread):
     """Write one scientific or presentation export off the GUI thread."""
 
-    progress = pyqtSignal(str, float)
-    done = pyqtSignal(str)
-    failed = pyqtSignal(str)
-    cancelled = pyqtSignal()
+    progress = Signal(str, float)
+    done = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, dataset, geometry, path: Path, kind: str,
                  channel_views: list[render.ChannelView], blend_mode: str,
@@ -230,7 +230,7 @@ class MosaicExportWorker(QThread):
 
 
 class MosaicChannelRow(QWidget):
-    changed = pyqtSignal()
+    changed = Signal()
 
     def __init__(self, channel, color, enabled=True, parent=None):
         super().__init__(parent)
@@ -429,10 +429,10 @@ class ScaleBarDialog(QDialog):
 class MosaicWorkspace(QGroupBox):
     """Compact, task-oriented controls shown below the mosaic viewer."""
 
-    build_requested = pyqtSignal(str, str)
-    export_requested = pyqtSignal(str)
-    views_changed = pyqtSignal()
-    scale_bar_changed = pyqtSignal(object)
+    build_requested = Signal(str, str)
+    export_requested = Signal(str)
+    views_changed = Signal()
+    scale_bar_changed = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__("通常画像セット — 広範囲モザイク", parent)

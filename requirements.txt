@@ -1,4 +1,7 @@
-PyQt6>=6.5
+# Only the LGPL-compatible Qt Core/Gui/Widgets runtime used by the app.
+# Do not replace with the PySide6 meta-package: it installs Addons and causes
+# unrelated Qt modules/plugins to enter frozen bundles.
+PySide6-Essentials==6.10.3
 numpy>=1.24
 Pillow>=10.0
 tifffile>=2023.7          # OME-TIFF output for stitched mosaics

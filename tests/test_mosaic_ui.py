@@ -10,10 +10,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["BZPS_TEST"] = "1"
 
 import numpy as np
-from PyQt6 import sip
-from PyQt6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QThread
-from PyQt6.QtGui import QCloseEvent, QImage, QPixmap
-from PyQt6.QtWidgets import QApplication, QGroupBox, QPushButton, QScrollArea
+from shiboken6 import Shiboken
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QThread
+from PySide6.QtGui import QCloseEvent, QImage, QPixmap
+from PySide6.QtWidgets import QApplication, QGroupBox, QPushButton, QScrollArea
 
 import main
 import mosaic_engine
@@ -77,6 +77,15 @@ class MosaicUiTests(unittest.TestCase):
             ("2  プレート画像セットを読み込む", "プレート画像セットを選ぶ…"),
             ("3  .ktfファイルを読み込む", ".ktf画像セットを選ぶ…"),
         ])
+
+    def test_about_discloses_pyside_and_lgpl(self):
+        window = self._window()
+        with patch.object(main.QMessageBox, "about") as about:
+            window._about()
+        html = about.call_args.args[2]
+        self.assertIn("PySide6", html)
+        self.assertIn("LGPLv3", html)
+        self.assertIn("THIRD_PARTY_NOTICES.md", html)
 
     def test_supported_sizes_and_mode_visibility(self):
         window = self._window()
@@ -248,7 +257,7 @@ class MosaicUiTests(unittest.TestCase):
             self.app.processEvents()
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             self.assertIsNone(getattr(window, attribute))
-            self.assertTrue(sip.isdeleted(worker), attribute)
+            self.assertFalse(Shiboken.isValid(worker), attribute)
 
     def test_stale_detail_finish_does_not_clear_new_worker(self):
         window = self._window()
@@ -265,7 +274,7 @@ class MosaicUiTests(unittest.TestCase):
         self.assertIs(window._mosaic_detail_worker, new_worker)
         self.assertTrue(window._detail_pending)
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        self.assertTrue(sip.isdeleted(old_worker))
+        self.assertFalse(Shiboken.isValid(old_worker))
         window._mosaic_detail_worker = None
         new_worker.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
