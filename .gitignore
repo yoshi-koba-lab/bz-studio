@@ -28,6 +28,11 @@ sample_data/*.ktf
 scratchpad/
 synthetic/
 
+# Agent handoff notes — local only. HANDOFF.md in particular names real
+# experiment folders and drive paths; neither belongs on the public repo.
+AGENTS.md
+HANDOFF.md
+
 # Exported results — the app's save dialogs default to the working directory, so
 # real experiment output easily lands here. Never publish it.
 *.ktf
