@@ -45,11 +45,13 @@ from PyQt6.QtWidgets import (
     QProxyStyle, QStyle, QDialogButtonBox, QDialog, QComboBox,
 )
 from PyQt6.QtCore import (
-    Qt, QSize, pyqtSignal, QPoint, QRect, QThread, QTimer, QPointF, QEvent, QSettings, QUrl,
+    Qt, QSize, QSizeF, QMarginsF, pyqtSignal, QPoint, QRect, QThread, QTimer,
+    QPointF, QEvent, QSettings, QUrl, QSaveFile, QIODevice,
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QAction, QWheelEvent,
     QMouseEvent, QPen, QFont, QKeySequence, QBrush, QDesktopServices,
+    QPdfWriter, QPageSize, QPageLayout,
 )
 
 import ktf_reader
@@ -1034,8 +1036,8 @@ class MainWindow(QMainWindow):
         b2.clicked.connect(lambda: self._export("tiff"))
         b3 = QPushButton("Export All Wells (TIFF)…")
         b3.clicked.connect(self._export_all_wells)
-        b4 = QPushButton("Export Plate to PDF…")
-        b4.setToolTip("All wells arranged as a contact sheet in one PDF (quality selectable)")
+        b4 = QPushButton("Plate PDFを書き出す…")
+        b4.setToolTip("現在の撮影、複数Stack、複数time point、または両方を1つのPDFにまとめます")
         b4.clicked.connect(self._export_plate_pdf)
         # Stitching belongs to the raw workflow only — it lives in the raw panel.
         for b in (b1, b2, b3, b4):
@@ -1322,6 +1324,12 @@ class MainWindow(QMainWindow):
                 "別のフォルダを選ぶか、File ▸ Choose Workflow… で"
                 "もう一方のワークフローをお試しください。")
             return
+        if mode == StartModeDialog.KTF:
+            if self._experiment and Path(self._experiment["path"]) not in set(dirs):
+                self._experiment = None
+                self._reset_well_state()
+                self.well_plate.set_wells({})
+                self.conditions.set_wells([], {})
         self._set_mode(mode)
         self.folder_tree.clear()
         if mode == StartModeDialog.KTF:
@@ -1948,6 +1956,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Don't let a half-written mosaic be left behind on quit."""
+        if self._exporting:
+            QMessageBox.information(
+                self, "書き出し中です",
+                "PDFまたは画像の書き出しが完了するまでお待ちください。")
+            event.ignore()
+            return
         if self._stitch_worker is not None and self._stitch_worker.isRunning():
             ans = QMessageBox.question(
                 self, "Stitching in progress",
@@ -2103,14 +2117,18 @@ class MainWindow(QMainWindow):
         """Composite a well from its embedded per-channel JPEG thumbnails (fast; no full read)."""
         thumbs = {}
         for ch_id, info in channels.items():
-            if info.thumbnail_jpeg:
-                try:
-                    im = Image.open(io.BytesIO(info.thumbnail_jpeg)).convert("L")
-                    thumbs[ch_id] = np.array(im)
-                except Exception:
-                    pass
+            if not info.thumbnail_jpeg:
+                raise OSError(
+                    f"{info.path.name} ({ch_id}) に埋め込みサムネイルがありません。"
+                    "Draft以外の画質をお試しください")
+            try:
+                im = Image.open(io.BytesIO(info.thumbnail_jpeg)).convert("L")
+                thumbs[ch_id] = np.array(im)
+            except Exception as e:
+                raise OSError(
+                    f"{info.path.name} ({ch_id}) のサムネイルを読み込めません") from e
         if not thumbs:
-            return None
+            raise OSError("このwellのサムネイルを読み込めません")
         max_h = max(a.shape[0] for a in thumbs.values())
         max_w = max(a.shape[1] for a in thumbs.values())
         views, images = [], {}
@@ -2151,8 +2169,9 @@ class MainWindow(QMainWindow):
         for ch_id, info in channels.items():
             try:
                 img = ktf_reader.reconstruct_image(info.path, downsample=ds)
-            except Exception:
-                continue
+            except Exception as e:
+                raise OSError(
+                    f"{info.path.name} ({ch_id}) の画像を再構成できません") from e
             if img.shape != (th, tw):
                 img = np.array(Image.fromarray(img).resize((tw, th), Image.Resampling.LANCZOS))
             lo, hi = self._levels_for(ch_id, img, settings)
@@ -2167,13 +2186,26 @@ class MainWindow(QMainWindow):
             ))
             images[ch_id] = img
         if not images:
-            return None
+            raise OSError("このwellの画像を再構成できません")
         return Image.fromarray(render.composite(views, images))
 
     # ---------- per-well caption from the Conditions tab ----------
     def _conditions_snapshot(self):
         """Current Conditions table as ({well: [values]}, headers)."""
         data = self.conditions.to_dict()
+        headers = data.get("__headers__") or list(WellConditionsTable.DEFAULT_HEADERS)
+        return data, headers
+
+    def _conditions_snapshot_for(self, path):
+        """Conditions for one experiment without changing the visible table."""
+        current = self._experiment["path"] if self._experiment else None
+        if current is not None and Path(current) == Path(path):
+            return self._conditions_snapshot()
+        raw = QSettings().value(f"conditions/{Path(path)}", "")
+        try:
+            data = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            data = {}
         headers = data.get("__headers__") or list(WellConditionsTable.DEFAULT_HEADERS)
         return data, headers
 
@@ -2241,85 +2273,287 @@ class MainWindow(QMainWindow):
         "Maximum — overview sheet + one well per page": ("full", 0, 300, "both"),
     }
 
+    def _pdf_default_name(self, paths, first_label=""):
+        if len(paths) == 1:
+            base = _safe_base_name(first_label or paths[0].name)
+            return f"{base}_plate.pdf"
+        base = _safe_base_name(first_label or paths[0].name) or "plate"
+        return f"{base}_plate_series.pdf"
+
+    def _plate_sheet_layout(self, wells, panel):
+        rows = sorted(set(w[0] for w in wells))
+        cols = sorted(set(w[1:] for w in wells),
+                      key=lambda c: int(c) if c.isdigit() else 0)
+        native = panel == 0
+        if native:
+            panel = self._max_well_dim(wells)
+        cell_w = panel
+        cell_h = max(1, int(round(panel * self._well_aspect(wells))))
+        k = panel / 380.0
+        pad, hdr, title_h = int(12 * k), int(30 * k), int(48 * k)
+        grid_w = hdr + len(cols) * (cell_w + pad) + pad
+        grid_h = title_h + hdr + len(rows) * (cell_h + pad) + pad
+        return {
+            "rows": rows, "cols": cols, "native": native, "panel": panel,
+            "cell_w": cell_w, "cell_h": cell_h, "k": k,
+            "pad": pad, "hdr": hdr, "title_h": title_h,
+            "grid_w": grid_w, "grid_h": grid_h,
+            "est_bytes": grid_w * grid_h * 3,
+        }
+
+    def _confirm_large_pdf_sheets(self, series, panel, with_pages):
+        large = []
+        for exp, _conditions in series:
+            geom = self._plate_sheet_layout(exp["wells"], panel)
+            if geom["est_bytes"] > 1_000_000_000:
+                large.append((exp["name"], geom))
+        if not large:
+            return True
+        shown = "\n".join(
+            f"  • {name}: {g['grid_w']} × {g['grid_h']} px (~{g['est_bytes'] / 1e9:.1f} GB)"
+            for name, g in large[:8])
+        if len(large) > 8:
+            shown += f"\n  …ほか {len(large) - 8} 撮影"
+        note = ("\n\n各撮影のウェル別ページも、この後1ページずつ追加されます。"
+                if with_pages else
+                "\n\n「one well per page」は大幅に軽量です。")
+        ans = QMessageBox.question(
+            self, "非常に大きなPDFになります",
+            f"大きなコンタクトシートが {len(large)} 枚あります。\n{shown}"
+            f"{note}\n\n続けますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return ans == QMessageBox.StandardButton.Yes
+
+    def _iter_plate_series_pages(self, series, settings, source, panel, layout):
+        for exp, conditions in series:
+            if layout != "pages":
+                sheet = self._build_plate_sheet(
+                    exp["wells"], settings, source, panel, exp["name"],
+                    with_pages=(layout == "both"), conditions=conditions,
+                    confirm_large=False)
+                if sheet is None:
+                    raise RuntimeError(f"{exp['name']} のコンタクトシートを作成できませんでした")
+                yield sheet
+            if layout in ("pages", "both"):
+                yield from self._iter_well_pages(
+                    exp["wells"], settings, exp["name"], conditions=conditions)
+
+    @staticmethod
+    def _write_pdf_pages(path, pages, dpi, title):
+        """Stream raster pages to an atomically committed PDF."""
+        iterator = iter(pages)
+        page = next(iterator)
+        device = QSaveFile(str(path))
+        writer = None
+        painter = None
+        started = False
+        committed = False
+        try:
+            if not device.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(device.errorString() or "PDFの保存先を開けません")
+            writer = QPdfWriter(device)
+            writer.setResolution(int(dpi))
+            writer.setTitle(title)
+            writer.setCreator(f"{APP_NAME} {__version__}")
+            writer.setPageMargins(
+                QMarginsF(0, 0, 0, 0), QPageLayout.Unit.Millimeter)
+            painter = QPainter()
+
+            def paint_and_release(image):
+                """Keep full-page Qt/numpy buffers scoped to exactly one page."""
+                nonlocal started
+                rgb = image if image.mode == "RGB" else image.convert("RGB")
+                try:
+                    size = QPageSize(
+                        QSizeF(rgb.width * 25.4 / dpi, rgb.height * 25.4 / dpi),
+                        QPageSize.Unit.Millimeter)
+                    if not writer.setPageSize(size):
+                        raise OSError("PDFのページサイズを設定できません")
+                    if not started:
+                        if not painter.begin(writer):
+                            raise OSError("PDF writerを開始できません")
+                        started = True
+                    elif not writer.newPage():
+                        raise OSError("PDFに次のページを追加できません")
+                    arr = np.ascontiguousarray(np.asarray(rgb))
+                    qimg = QImage(
+                        arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 3,
+                        QImage.Format.Format_RGB888).copy()
+                    painter.drawImage(
+                        QRect(0, 0, writer.width(), writer.height()), qimg)
+                    del qimg, arr
+                finally:
+                    if rgb is not image:
+                        rgb.close()
+                    image.close()
+
+            while True:
+                paint_and_release(page)
+                page = None
+                try:
+                    page = next(iterator)
+                except StopIteration:
+                    break
+
+            if not painter.end():
+                raise OSError("PDF writerを終了できません")
+            painter = None
+            writer = None
+            if not device.commit():
+                raise OSError(device.errorString() or "PDFを保存できません")
+            committed = True
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if painter is not None and painter.isActive():
+                painter.end()
+            painter = None
+            writer = None
+            if not committed and device.isOpen():
+                device.cancelWriting()
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
     def _export_plate_pdf(self):
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self.statusBar().showMessage("フォルダのスキャン完了後にPDFを書き出してください。")
+            return
         if not self._experiment or not self._experiment["wells"] or self._busy:
             return
-        wells = self._experiment["wells"]
 
-        labels = list(self.PDF_QUALITY.keys())
-        # Build the picker manually and clear its stylesheet so it uses the native
-        # (readable) look instead of inheriting the app's dark theme.
-        dlg = QInputDialog(self)
+        current_path = Path(self._experiment["path"])
+        current_exp = dict(self._experiment)
+        current_conditions = self._conditions_snapshot()
+        settings = {c: ctrl.to_view() for c, ctrl in self._channel_controls.items()}
+        dlg = PlatePdfDialog(
+            [current_path], current_path, None,
+            list(self.PDF_QUALITY), self)
         dlg.setStyleSheet("")
-        dlg.setWindowTitle("Plate PDF quality")
-        dlg.setLabelText("Higher quality is sharper but reads the .ktf files and takes longer:")
-        dlg.setComboBoxItems(labels)
-        dlg.setTextValue(labels[2])  # default: High
-        dlg.setOption(QInputDialog.InputDialogOption.UseListViewForComboBoxItems, True)
         if not dlg.exec():
             return
-        choice = dlg.textValue()
-        source, panel, dpi, layout = self.PDF_QUALITY[choice]
-
-        default_name = f"{_safe_base_name(self._experiment['name'])}_plate.pdf"
-        path = _ask_save_path(self, "プレート PDF を名前を付けて保存",
-                              default_name, "PDF (*.pdf)")
-        if path is None:
-            return
-        path = str(path)
-
-        settings = {c: ctrl.to_view() for c, ctrl in self._channel_controls.items()}
-        exp_name = self._experiment["name"]      # snapshot: processEvents() runs below
+        selected = dlg.selected
+        choice = dlg.quality
         self._exporting = True
         try:
-            if layout == "pages":
-                self._export_pdf_pages(wells, settings, dpi, path, choice, exp_name)
-                return
-            sheet = self._build_plate_sheet(wells, settings, source, panel, exp_name,
-                                            with_pages=(layout == "both"))
-            if sheet is None:
-                return
-            # Pages are yielded lazily so only one full-resolution well is held at a
-            # time on top of the sheet.
-            extra = (self._iter_well_pages(wells, settings, exp_name)
-                     if layout == "both" else [])
-            try:
-                sheet.save(path, "PDF", resolution=float(dpi), quality=95, subsampling=0,
-                           save_all=(layout == "both"), append_images=extra)
-                self.statusBar().showMessage(
-                    f"Exported plate PDF ({len(wells)} wells, {choice.split(' —')[0]}"
-                    + (" + per-well pages" if layout == "both" else "") + f") to {path}")
-            except MemoryError:
-                self.statusBar().showMessage(
-                    "Out of memory writing the PDF — try “one well per page”.")
-            except Exception as e:
-                self.statusBar().showMessage(f"PDF export failed: {e}")
+            self._export_plate_pdf_selection(
+                selected, choice, current_path, current_exp, current_conditions, settings)
         finally:
             self._exporting = False
             self.progress_bar.hide()
 
-    def _build_plate_sheet(self, wells, settings, source, panel, exp_name, with_pages=False):
+    def _export_plate_pdf_selection(
+            self, selected, choice, current_path, current_exp, current_conditions, settings):
+        source, panel, dpi, layout = self.PDF_QUALITY[choice]
+
+        series, issues = [], []
+        self.statusBar().showMessage(f"{len(selected)} 撮影を確認中…")
+        for i, (path, label) in enumerate(selected):
+            QApplication.processEvents()
+            try:
+                if path == current_path:
+                    exp = dict(current_exp)
+                    conditions = current_conditions
+                else:
+                    exp = ktf_reader.scan_experiment_folder(path)
+                    conditions = self._conditions_snapshot_for(path)
+                if not exp["wells"]:
+                    raise ValueError("読み取れるウェルがありません")
+                exp["name"] = label
+                series.append((exp, conditions))
+                for filename, error in exp.get("errors") or []:
+                    issues.append(f"{label}: {filename} を読み込めません ({error})")
+            except Exception as e:
+                issues.append(f"{label}: 撮影を含められません ({e})")
+            self.statusBar().showMessage(f"撮影を確認中 ({i + 1}/{len(selected)}): {label}")
+
+        if not series:
+            QMessageBox.warning(
+                self, "書き出せる撮影がありません", "\n".join(issues[:12]))
+            return
+
+        ref_structure = {
+            well: tuple(sorted(channels))
+            for well, channels in series[0][0]["wells"].items()}
+        ref_wells = set(ref_structure)
+        ref_channels = {
+            channel for channels in series[0][0]["wells"].values() for channel in channels}
+        for exp, _conditions in series[1:]:
+            structure = {
+                well: tuple(sorted(per_well))
+                for well, per_well in exp["wells"].items()}
+            wells = set(structure)
+            channels = {
+                channel for per_well in exp["wells"].values() for channel in per_well}
+            if structure != ref_structure:
+                issues.append(
+                    f"{exp['name']}: 先頭撮影と構成が異なります "
+                    f"(wells {len(wells)}/{len(ref_wells)}, "
+                    f"channels {', '.join(sorted(channels)) or '-'} / "
+                    f"{', '.join(sorted(ref_channels)) or '-'})")
+
+        if issues:
+            shown = "\n".join(f"  • {line}" for line in issues[:10])
+            if len(issues) > 10:
+                shown += f"\n  …ほか {len(issues) - 10} 件"
+            ans = QMessageBox.question(
+                self, "撮影データを確認してください",
+                f"読取失敗、またはwell/channel構成の差があります。\n{shown}\n\n"
+                f"読めた {len(series)} 撮影で続けますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        selected_paths = [Path(exp["path"]) for exp, _conditions in series]
+        first_label = series[0][0]["name"]
+        default_name = self._pdf_default_name(selected_paths, first_label)
+        path = _ask_save_path(self, "プレート PDF を名前を付けて保存",
+                              default_name, "PDF (*.pdf)")
+        if path is None:
+            return
+        problem = _writable_problem(path.parent)
+        if problem:
+            QMessageBox.critical(self, "この場所には保存できません", problem)
+            return
+        if layout != "pages" and not self._confirm_large_pdf_sheets(
+                series, panel, with_pages=(layout == "both")):
+            self.statusBar().showMessage("PDF書き出しをキャンセルしました。")
+            return
+
+        try:
+            pages = self._iter_plate_series_pages(
+                series, settings, source, panel, layout)
+            self._write_pdf_pages(path, pages, dpi, path.stem)
+            self._remember_export_dir(path.parent)
+            self.statusBar().showMessage(
+                f"{len(series)} 撮影を1つのPDFに書き出しました: {path}")
+        except StopIteration:
+            self.statusBar().showMessage("書き出せるページがありません。")
+        except MemoryError:
+            self.statusBar().showMessage(
+                "メモリ不足です。「one well per page」または低い画質をお試しください。")
+        except Exception as e:
+            msg = _friendly_error(e)
+            self.statusBar().showMessage(f"PDF書き出しに失敗しました: {msg}")
+            QMessageBox.warning(self, "PDF書き出しに失敗しました", msg)
+
+    def _build_plate_sheet(self, wells, settings, source, panel, exp_name, with_pages=False,
+                           conditions=None, confirm_large=True):
         """Render every well into one contact sheet. Returns the image, or None."""
-        rows = sorted(set(w[0] for w in wells))
-        cols = sorted(set(w[1:] for w in wells), key=lambda c: int(c) if c.isdigit() else 0)
-        cond, headers = self._conditions_snapshot()
+        cond, headers = conditions if conditions is not None else self._conditions_snapshot()
+        geom = self._plate_sheet_layout(wells, panel)
+        rows, cols = geom["rows"], geom["cols"]
+        native, panel = geom["native"], geom["panel"]
+        cell_w, cell_h, k = geom["cell_w"], geom["cell_h"], geom["k"]
+        pad, hdr, title_h = geom["pad"], geom["hdr"], geom["title_h"]
+        grid_w, grid_h, est_bytes = geom["grid_w"], geom["grid_h"], geom["est_bytes"]
 
-        native = panel == 0
-        if native:                       # "all wells on one sheet" at original size
-            panel = self._max_well_dim(wells)
-        cell_w = panel
-        cell_h = max(1, int(round(panel * self._well_aspect(wells))))
-
-        pad, hdr, title_h = 12, 30, 48
-        # scale chrome (padding / headers / fonts) with panel size so large panels
-        # don't get tiny labels
-        k = panel / 380.0
-        pad, hdr, title_h = int(pad * k), int(hdr * k), int(title_h * k)
-        grid_w = hdr + len(cols) * (cell_w + pad) + pad
-        grid_h = title_h + hdr + len(rows) * (cell_h + pad) + pad
-
-        est_bytes = grid_w * grid_h * 3
-        if est_bytes > 1_000_000_000:
+        if confirm_large and est_bytes > 1_000_000_000:
             gb = est_bytes / 1e9
             extra_note = ("\n\nPer-well pages are added afterwards, one at a time."
                           if with_pages else
@@ -2379,6 +2613,8 @@ class MainWindow(QMainWindow):
                     canvas.paste(im, (x0 + (cell_w - im.width) // 2,
                                       y0 + (cell_h - im.height) // 2))
                     im = None            # release before the next well is decoded
+                else:
+                    raise OSError(f"{exp_name} / {wid} の画像を描画できません")
                 self._draw_well_caption(
                     canvas, draw, x0 + int(6 * k), y0 + int(6 * k), wid,
                     self._caption_lines(wid, cond, headers),
@@ -2387,14 +2623,14 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setValue(done)
         return canvas
 
-    def _iter_well_pages(self, wells, settings, exp_name, order=None):
+    def _iter_well_pages(self, wells, settings, exp_name, order=None, conditions=None):
         """Yield one original-resolution page per well (lazy: one page in memory)."""
         order = order if order is not None else sorted(wells)
         total = len(order)
         f_lbl = self._load_font(40)
         f_id = self._load_font(46)
         f_cond = self._load_font(34)
-        cond, headers = self._conditions_snapshot()
+        cond, headers = conditions if conditions is not None else self._conditions_snapshot()
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
@@ -2404,7 +2640,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             im = self._render_well_full(wells[wid], settings, 0)  # 0 = native
             if im is None:
-                continue
+                raise OSError(f"{exp_name} / {wid} の画像を描画できません")
             band = 56
             page = Image.new("RGB", (im.width, im.height + band), (255, 255, 255))
             page.paste(im, (0, band))
@@ -2418,28 +2654,6 @@ class MainWindow(QMainWindow):
                 f_id, f_cond, 14, page.width - 32)
             self.progress_bar.setValue(i + 1)
             yield page
-
-    def _export_pdf_pages(self, wells, settings, dpi, path, choice, exp_name):
-        """Maximum quality: one well per page at the file's original resolution."""
-        pages = self._iter_well_pages(wells, settings, exp_name)
-        try:
-            first = next(pages)
-        except StopIteration:
-            self.statusBar().showMessage("Nothing to export.")
-            return
-        try:
-            first.save(path, "PDF", resolution=float(dpi),
-                       save_all=True, append_images=pages,
-                       quality=100, subsampling=0)
-            self.statusBar().showMessage(
-                f"Exported full-resolution PDF ({len(wells)} wells, one per page) to {path} "
-                f"— PDF images are JPEG-encoded; use Export TIFF for lossless")
-        except MemoryError:
-            self.statusBar().showMessage(
-                "Out of memory at original resolution — try “Ultra” instead.")
-        except Exception as e:
-            self.statusBar().showMessage(f"PDF export failed: {e}")
-
 
 REPO = "yoshi-koba-lab/bz-plate-studio"
 
@@ -2621,6 +2835,11 @@ _WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
                  *(f"LPT{i}" for i in range(1, 10))}
 
 
+def _natural_key(text):
+    return tuple((1, int(part)) if part.isdigit() else (0, part.casefold())
+                 for part in re.split(r"(\d+)", str(text)) if part)
+
+
 def _safe_base_name(text: str) -> str:
     """A filename fragment that is legal on both macOS and Windows ("" if nothing left).
 
@@ -2697,6 +2916,353 @@ def _ask_save_path(parent, title, default_name, filt, derived=None):
         if _confirm_overwrite(parent, targets):
             return path
         start = str(path)                # reopen in the same folder, name preselected
+
+
+class PlatePdfDialog(QDialog):
+    """Choose any Stack/time point experiment folders for one PDF."""
+
+    def __init__(self, paths, current, root, quality_labels, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Plate PDF — Stack / time point")
+        self.setMinimumSize(760, 520)
+        self._current = Path(current)
+        self._current_key = self._path_key(self._current)
+        self._root = Path(root) if root is not None else None
+        self._items = []
+        self._path_items = {}
+        self._last_add_dir = self._current.parent
+
+        lay = QVBoxLayout(self)
+        intro = QLabel(
+            "同じプレートとしてまとめる撮影フォルダだけを選択してください。"
+            "選択した撮影は、下の順番で1つのPDFに収録されます。")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        scope = QLabel(f"現在の撮影: {self._current}")
+        scope.setWordWrap(True)
+        scope.setStyleSheet("color:#1d4ed8; font-size:11px;")
+        lay.addWidget(scope)
+
+        hint = QLabel(
+            "最初は現在の撮影だけが入っています。"
+            "別撮影のStack／time pointは「撮影フォルダを追加…」から1件ずつ追加できます。"
+            "KTFを直接含むフォルダを選んでください（1撮影＝1フォルダ）。"
+            "サブフォルダは検索せず、KTF未生成の撮影は追加できません。"
+            "同一プレートかどうかは自動判定しません。"
+            "絞り込みはフォルダ名と全KTFファイル名を1語の部分一致で検索します。"
+            "必要なら選択後に「上へ／下へ」で時系列順を直してください。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#6b7280; font-size:11px;")
+        lay.addWidget(hint)
+
+        add_row = QHBoxLayout()
+        self.btn_add_folder = QPushButton("＋ 撮影フォルダを追加…")
+        self.btn_add_folder.clicked.connect(self._add_capture_folder)
+        add_row.addWidget(self.btn_add_folder)
+        add_note = QLabel("別々の場所にある撮影も追加できます")
+        add_note.setStyleSheet("color:#6b7280; font-size:11px;")
+        add_row.addWidget(add_note)
+        add_row.addStretch()
+        lay.addLayout(add_row)
+
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("絞り込み:"))
+        self.ed_filter = QLineEdit()
+        self.ed_filter.setPlaceholderText("例: Day7 または Stack1（1語）")
+        self.ed_filter.textChanged.connect(self._filter_items)
+        filters.addWidget(self.ed_filter, stretch=1)
+        lay.addLayout(filters)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(
+            ["撮影フォルダ（Stack / time point）", "KTFファイル名の例", "Wells", "Channels"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        for path in paths:
+            path = Path(path)
+            key = self._path_key(path)
+            self._add_path_item(
+                path, checked=(key == self._current_key),
+                focus=(key == self._current_key))
+        self.tree.resizeColumnToContents(0)
+        self.tree.resizeColumnToContents(1)
+        self.tree.resizeColumnToContents(2)
+        self.tree.resizeColumnToContents(3)
+        self.tree.itemChanged.connect(self._update_selection_label)
+        lay.addWidget(self.tree, stretch=1)
+
+        selects = QHBoxLayout()
+        for label, slot in [
+            ("現在のみ", self._select_current_only),
+            ("絞り込み結果だけ選択", self._select_filtered_only),
+            ("一覧を全選択", self._select_all),
+            ("選択解除", self._select_none),
+        ]:
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            selects.addWidget(btn)
+        self.btn_up = QPushButton("↑ 上へ")
+        self.btn_up.clicked.connect(lambda: self._move_current(-1))
+        selects.addWidget(self.btn_up)
+        self.btn_down = QPushButton("↓ 下へ")
+        self.btn_down.clicked.connect(lambda: self._move_current(1))
+        selects.addWidget(self.btn_down)
+        selects.addStretch()
+        lay.addLayout(selects)
+
+        self.lbl_selected = QLabel()
+        self.lbl_selected.setStyleSheet("color:#6b7280; font-size:11px;")
+        lay.addWidget(self.lbl_selected)
+        self._update_selection_label()
+
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(QLabel("画質・ページ構成:"))
+        self.cmb_quality = QComboBox()
+        self.cmb_quality.addItems(quality_labels)
+        self.cmb_quality.setCurrentIndex(min(2, len(quality_labels) - 1))
+        quality_row.addWidget(self.cmb_quality, stretch=1)
+        lay.addLayout(quality_row)
+
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        box.button(QDialogButtonBox.StandardButton.Save).setText("PDFを書き出す")
+        box.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        lay.addWidget(box)
+
+    @staticmethod
+    def _path_key(path):
+        return os.path.normcase(str(Path(path).resolve()))
+
+    def _label(self, path):
+        if self._root is not None:
+            try:
+                rel = path.relative_to(self._root)
+                if rel.parts:
+                    return str(rel)
+            except ValueError:
+                pass
+        return str(Path(path.parent.name) / path.name)
+
+    def _unique_export_label(self, path):
+        label = self._label(path)
+        used = {
+            item.data(0, Qt.ItemDataRole.UserRole + 2)
+            for item in self._items
+        }
+        if label not in used:
+            return label
+        parts = path.parts
+        for depth in range(3, len(parts) + 1):
+            candidate = str(Path(*parts[-depth:]))
+            if candidate not in used:
+                return candidate
+        return str(path)
+
+    def _add_path_item(self, path, checked=False, focus=False, require_ktf=False):
+        path = Path(path)
+        key = self._path_key(path)
+        existing = self._path_items.get(key)
+        if existing is not None:
+            if checked:
+                existing.setCheckState(0, Qt.CheckState.Checked)
+            if focus:
+                self.tree.setCurrentItem(existing)
+                self.tree.scrollToItem(existing)
+            return existing
+
+        example, wells, channels, search_text = self._source_info(path)
+        partial_errors = []
+        if require_ktf and not example:
+            QMessageBox.warning(
+                self, "KTF撮影フォルダではありません",
+                f"“{path}” にはKTFファイルが直接入っていません。\n\n"
+                "各wellのKTFファイルを直接含む撮影フォルダを選択してください。")
+            return None
+        if require_ktf:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            scan_error = None
+            try:
+                experiment = ktf_reader.scan_experiment_folder(path)
+            except Exception as e:
+                scan_error = e
+            finally:
+                QApplication.restoreOverrideCursor()
+            if scan_error is not None:
+                QMessageBox.warning(
+                    self, "撮影フォルダを読み込めません",
+                    f"“{path}” を読み込めませんでした。\n\n"
+                    f"{_friendly_error(scan_error)}")
+                return None
+            if not experiment["wells"]:
+                detail = ""
+                if experiment.get("errors"):
+                    detail = f"\n\n読取不能なKTF: {len(experiment['errors'])} 件"
+                QMessageBox.warning(
+                    self, "読み取れるKTFがありません",
+                    f"“{path}” には読み取れるwell画像がありません。{detail}")
+                return None
+            wells = len(experiment["wells"])
+            channel_ids = {
+                channel
+                for per_well in experiment["wells"].values()
+                for channel in per_well
+            }
+            channels = ", ".join(sorted(channel_ids))
+            partial_errors = experiment.get("errors") or []
+
+        label = self._unique_export_label(path)
+        item = QTreeWidgetItem(self.tree)
+        item.setText(0, label)
+        item.setText(1, ("⚠ " if partial_errors else "") + example)
+        item.setText(2, str(wells))
+        item.setText(3, channels)
+        item.setToolTip(0, str(path))
+        item.setData(0, Qt.ItemDataRole.UserRole, str(path))
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, f"{path} {search_text}")
+        item.setData(0, Qt.ItemDataRole.UserRole + 2, label)
+        if partial_errors:
+            item.setToolTip(
+                1, f"{len(partial_errors)} 件のKTFを読み取れません。"
+                "PDF書き出し前にもう一度確認します。")
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        self._items.append(item)
+        self._path_items[key] = item
+        item.setCheckState(
+            0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        if focus:
+            self.tree.setCurrentItem(item)
+            self.tree.scrollToItem(item)
+        if partial_errors:
+            QMessageBox.warning(
+                self, "一部のKTFを読み取れません",
+                f"“{path}” は追加しましたが、{len(partial_errors)} 件のKTFを"
+                "読み取れません。PDF書き出し前にも確認します。")
+        return item
+
+    def _add_capture_folder(self):
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Stack / time point の撮影フォルダを追加",
+            str(self._last_add_dir))
+        if not chosen:
+            return
+        path = Path(chosen)
+        self._last_add_dir = path.parent
+        self.ed_filter.clear()
+        item = self._add_path_item(path, checked=True, focus=True, require_ktf=True)
+        if item is not None:
+            for column in range(4):
+                self.tree.resizeColumnToContents(column)
+            self._update_selection_label()
+
+    def _filter_items(self, text):
+        needle = text.strip().casefold()
+        for item in self._items:
+            haystack = (
+                f"{item.text(0)} "
+                f"{item.data(0, Qt.ItemDataRole.UserRole + 1) or ''}").casefold()
+            matched = not needle or needle in haystack
+            if matched and needle and needle[-1].isdigit():
+                matched = re.search(re.escape(needle) + r"(?!\d)", haystack) is not None
+            item.setHidden(not matched)
+        if hasattr(self, "btn_up"):
+            self.btn_up.setEnabled(not needle)
+            self.btn_down.setEnabled(not needle)
+        self._update_selection_label()
+
+    @staticmethod
+    def _source_info(path):
+        try:
+            names, wells, channels = [], set(), set()
+            for p in path.iterdir():
+                if not ktf_reader.is_ktf_file(p):
+                    continue
+                names.append(p.stem)
+                for part in p.stem.split("_"):
+                    if len(part) >= 2 and part[0].isalpha() and part[1:].isdigit():
+                        wells.add(part)
+                    if part.startswith("CH"):
+                        channels.add(part)
+        except OSError:
+            return "", 0, "", ""
+        example = min(names, key=_natural_key) if names else ""
+        return example, len(wells), ", ".join(sorted(channels)), " ".join(names)
+
+    def _select_current_only(self):
+        for item in self._items:
+            item.setCheckState(
+                0, Qt.CheckState.Checked
+                if self._path_key(item.data(0, Qt.ItemDataRole.UserRole)) == self._current_key
+                else Qt.CheckState.Unchecked)
+
+    def _select_filtered_only(self):
+        for item in self._items:
+            item.setCheckState(
+                0, Qt.CheckState.Unchecked if item.isHidden() else Qt.CheckState.Checked)
+
+    def _select_all(self):
+        for item in self._items:
+            item.setCheckState(0, Qt.CheckState.Checked)
+
+    def _select_none(self):
+        for item in self._items:
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+
+    def _move_current(self, delta):
+        if any(item.isHidden() for item in self._items):
+            return
+        item = self.tree.currentItem()
+        if item is None:
+            return
+        index = self.tree.indexOfTopLevelItem(item)
+        target = index + delta
+        if index < 0 or target < 0 or target >= self.tree.topLevelItemCount():
+            return
+        item = self.tree.takeTopLevelItem(index)
+        self.tree.insertTopLevelItem(target, item)
+        self.tree.setCurrentItem(item)
+
+    def _update_selection_label(self):
+        selected = self.selected
+        hidden = sum(item.isHidden() and item.checkState(0) == Qt.CheckState.Checked
+                     for item in self._items)
+        suffix = f"（絞り込みで非表示: {hidden}）" if hidden else ""
+        self.lbl_selected.setText(f"選択中: {len(selected)} 撮影 {suffix}")
+
+    @property
+    def selected(self):
+        out = []
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.checkState(0) == Qt.CheckState.Checked:
+                out.append((
+                    Path(item.data(0, Qt.ItemDataRole.UserRole)),
+                    item.data(0, Qt.ItemDataRole.UserRole + 2)))
+        return out
+
+    @property
+    def quality(self):
+        return self.cmb_quality.currentText()
+
+    def accept(self):
+        if not self.selected:
+            QMessageBox.warning(self, "撮影が選ばれていません",
+                                "PDFに含める撮影を1つ以上選択してください。")
+            return
+        hidden = [item for item in self._items
+                  if item.isHidden() and item.checkState(0) == Qt.CheckState.Checked]
+        if hidden:
+            ans = QMessageBox.question(
+                self, "非表示の撮影も選択されています",
+                f"絞り込みで見えていない撮影が {len(hidden)} 件選択されています。"
+                "それらもPDFに含めますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        super().accept()
 
 
 class OutputTargetDialog(QDialog):
