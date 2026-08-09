@@ -42,14 +42,15 @@ from PyQt6.QtWidgets import (
     QFileDialog, QGridLayout, QSizePolicy, QTextEdit,
     QProgressBar, QColorDialog, QToolBar, QInputDialog, QLineEdit,
     QTabWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, QMessageBox, QMenu,
-    QProxyStyle, QStyle, QDialogButtonBox, QDialog, QComboBox,
+    QProxyStyle, QStyle, QDialogButtonBox, QDialog, QComboBox, QDockWidget,
+    QHeaderView,
 )
 from PyQt6.QtCore import (
     Qt, QSize, QSizeF, QMarginsF, pyqtSignal, QPoint, QRect, QThread, QTimer,
     QPointF, QEvent, QSettings, QUrl, QSaveFile, QIODevice,
 )
 from PyQt6.QtGui import (
-    QImage, QPixmap, QPainter, QColor, QAction, QWheelEvent,
+    QImage, QPixmap, QIcon, QPainter, QColor, QAction, QWheelEvent,
     QMouseEvent, QPen, QFont, QKeySequence, QBrush, QDesktopServices,
     QPdfWriter, QPageSize, QPageLayout,
 )
@@ -70,6 +71,10 @@ CHANNEL_COLORS = {
 }
 
 MAX_DISPLAY_MEGAPIXELS = 16  # overview cap
+
+
+def _path_key(path) -> str:
+    return os.path.normcase(str(Path(path).resolve()))
 
 
 def auto_downsample(width: int, height: int) -> int:
@@ -659,7 +664,7 @@ class WellPlateWidget(QWidget):
                 pix = QPixmap.fromImage(qimg).scaled(
                     110, 80, Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation)
-                btn.setIcon(pix)
+                btn.setIcon(QIcon(pix))
                 btn.setIconSize(QSize(110, 80))
         btn.setText(well_id)
         btn.clicked.connect(lambda _, w=well_id: self.well_clicked.emit(w))
@@ -892,6 +897,7 @@ class MainWindow(QMainWindow):
         self._pending = 0
         self._gen = 0                 # bumped on every well load; stale worker results discarded
         self._detail_pending = False  # a viewport changed while a detail worker was running
+        self._loading_experiment = False
         self._mode = None             # None | "ktf" | "raw"
         self._raw_experiment = None   # raw model, kept separate from _experiment
         self._current_raw_well = None
@@ -900,10 +906,13 @@ class MainWindow(QMainWindow):
         self._exporting = False       # a synchronous export is running
         self._stitch_worker = None    # asynchronous stitch (own lifetime)
         self._current_composite = None
+        self._plate_series_dock = None
+        self._plate_series_builder = None
 
         self._setup_ui()
         self._setup_menu()
         self._setup_toolbar()
+        self._setup_plate_series_dock()
         self._apply_style()
         self._update_checker = None
         if QSettings().value("check_updates", "1") == "1":
@@ -1029,22 +1038,31 @@ class MainWindow(QMainWindow):
         bl.addWidget(meta_group, stretch=1)
 
         export_group = QGroupBox("Export")
+        export_group.setObjectName("quickExportGroup")
         eg = QVBoxLayout(export_group)
+        eg.setSpacing(4)
         b1 = QPushButton("Export PNG (view)…")
         b1.clicked.connect(lambda: self._export("png"))
         b2 = QPushButton("Export TIFF (full res)…")
         b2.clicked.connect(lambda: self._export("tiff"))
         b3 = QPushButton("Export All Wells (TIFF)…")
         b3.clicked.connect(self._export_all_wells)
-        b4 = QPushButton("Plate PDFを書き出す…")
-        b4.setToolTip("現在の撮影、複数Stack、複数time point、または両方を1つのPDFにまとめます")
-        b4.clicked.connect(self._export_plate_pdf)
+        self.btn_series_pdf = QPushButton("Stack / time series PDF…")
+        self.btn_series_pdf.setObjectName("primaryExportButton")
+        self.btn_series_pdf.setToolTip(
+            "別々に撮影したStack・time pointを選び、1つのプレートPDFにまとめます")
+        self.btn_series_pdf.clicked.connect(self._export_plate_pdf)
+        self.lbl_series_pdf = QLabel("撮影を開くとシリーズを作成できます")
+        self.lbl_series_pdf.setWordWrap(True)
+        self.lbl_series_pdf.setStyleSheet("color:#6b7280; font-size:10px;")
         # Stitching belongs to the raw workflow only — it lives in the raw panel.
-        for b in (b1, b2, b3, b4):
+        for b in (b1, b2, b3, self.btn_series_pdf):
             eg.addWidget(b)
+        eg.addWidget(self.lbl_series_pdf)
         eg.addStretch()
         bl.addWidget(export_group)
 
+        bottom.setMinimumHeight(170)
         bottom.setMaximumHeight(200)
         self.ktf_bottom = bottom
         rl.addWidget(bottom, stretch=0)
@@ -1081,6 +1099,10 @@ class MainWindow(QMainWindow):
         a.setStatusTip("Open a folder for the current workflow")
         a.triggered.connect(self._open_folder); fm.addAction(a)
         self.act_open = a
+        a = QAction("Stack / time series PDF…", self)
+        a.setStatusTip("複数撮影を選び、1つのプレートPDFにまとめます")
+        a.triggered.connect(self._export_plate_pdf); fm.addAction(a)
+        self.act_series_pdf = a
         fm.addSeparator()
         a = QAction("Quit", self); a.setShortcut(QKeySequence("Ctrl+Q"))
         a.triggered.connect(self.close); fm.addAction(a)
@@ -1105,6 +1127,7 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self.canvas.zoom_actual_pixels); vm.addAction(a)
         a = QAction("Auto Brightness/Contrast", self); a.setShortcut(QKeySequence("Ctrl+Shift+A"))
         a.triggered.connect(self._auto_contrast_all); vm.addAction(a)
+        self._update_series_export_state()
 
     def _setup_toolbar(self):
         tb = QToolBar("Main")
@@ -1120,6 +1143,46 @@ class MainWindow(QMainWindow):
             act.setToolTip(tip)
             act.triggered.connect(slot)
             tb.addAction(act)
+
+    def _setup_plate_series_dock(self):
+        builder = PlateSeriesBuilder(dict(self.PDF_QUALITY), self)
+        builder.capture_activated.connect(self._activate_series_capture)
+        builder.conditions_requested.connect(self._edit_series_conditions)
+        builder.export_requested.connect(self._export_plate_pdf_from_builder)
+        dock = QDockWidget("Series PDF Builder", self)
+        dock.setObjectName("PlateSeriesDock")
+        dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
+        dock.setWidget(builder)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+        self._plate_series_builder = builder
+        self._plate_series_dock = dock
+        dock.visibilityChanged.connect(self._on_plate_series_dock_visibility)
+        dock.hide()
+
+    def _on_plate_series_dock_visibility(self, visible):
+        # The builder needs a little more vertical space than the normal image
+        # workspace. The viewer remains fully usable, and returns to its larger
+        # minimum as soon as the builder is closed.
+        self.canvas.setMinimumHeight(180 if visible else 300)
+        if not visible:
+            self._plate_series_builder.flush_edits()
+
+    def _update_series_export_state(self):
+        ready = bool(
+            self._mode == StartModeDialog.KTF
+            and self._experiment
+            and self._experiment.get("wells"))
+        button = getattr(self, "btn_series_pdf", None)
+        if button is not None:
+            button.setEnabled(ready)
+        action = getattr(self, "act_series_pdf", None)
+        if action is not None:
+            action.setEnabled(ready)
+        hint = getattr(self, "lbl_series_pdf", None)
+        if hint is not None:
+            hint.setText(
+                "複数の撮影フォルダを1つのPDFへ"
+                if ready else "撮影を開くとシリーズを作成できます")
 
     def _check_updates(self, quiet=True):
         """Ask GitHub whether a newer release exists.
@@ -1168,34 +1231,47 @@ class MainWindow(QMainWindow):
 
     def _apply_style(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background:#f4f5f7; color:#1c1e21; }
-            QGroupBox { border:1px solid #ccd0d6; border-radius:5px; margin-top:8px;
-                        padding-top:12px; font-weight:bold; color:#44484f;
-                        background:#fbfbfc; }
-            QGroupBox::title { subcontrol-origin:margin; left:10px; }
+            QMainWindow, QWidget { background:#f5f7fa; color:#20252b; }
+            QGroupBox { border:1px solid #d2d8e0; border-radius:8px; margin-top:10px;
+                        padding-top:14px; font-weight:bold; color:#3f4750;
+                        background:#fbfcfd; }
+            QGroupBox::title { subcontrol-origin:margin; left:12px; padding:0 3px; }
             QTreeWidget, QTextEdit, QTableWidget, QLineEdit, QComboBox {
-                background:#ffffff; border:1px solid #ccd0d6; color:#1c1e21; }
+                background:#ffffff; border:1px solid #cbd3dc; border-radius:6px;
+                color:#20252b; selection-background-color:#dcecff; }
             QTreeWidget { selection-background-color:#cfe1fb; selection-color:#0d1117;
                           alternate-background-color:#f7f8fa; }
-            QHeaderView::section { background:#eceff3; color:#3c4149;
-                                   border:1px solid #d6dae0; padding:3px; }
-            QTabBar::tab { background:#e6e9ee; color:#3c4149; padding:5px 12px;
-                           border:1px solid #ccd0d6; border-bottom:none;
-                           border-top-left-radius:4px; border-top-right-radius:4px; }
+            QTreeWidget::item { padding:4px 3px; }
+            QHeaderView::section { background:#eef1f5; color:#4b535c;
+                                   border:none; border-right:1px solid #d9dee5;
+                                   border-bottom:1px solid #d1d7de; padding:5px; }
+            QLineEdit, QComboBox { padding:5px 7px; }
+            QTabBar::tab { background:#e9edf2; color:#48515a; padding:7px 14px;
+                           border:1px solid #d0d6de; border-bottom:none;
+                           border-top-left-radius:6px; border-top-right-radius:6px; }
             QTabBar::tab:selected { background:#ffffff; color:#0d1117; }
             QSlider::groove:horizontal { height:4px; background:#d3d7dd; border-radius:2px; }
             QSlider::handle:horizontal { width:11px; height:11px; margin:-4px 0;
                                          background:#6b7280; border-radius:5px; }
-            QPushButton { background:#ffffff; border:1px solid #c2c7ce; border-radius:4px;
-                          padding:6px 10px; color:#1c1e21; }
+            QPushButton { background:#ffffff; border:1px solid #c4ccd5; border-radius:7px;
+                          padding:7px 11px; color:#20252b; }
             QPushButton:hover { background:#eef3fb; border-color:#5b8def; }
             QPushButton:disabled { background:#f0f1f3; color:#a0a4ab; border-color:#dcdfe4; }
+            QPushButton#primaryExportButton { background:#1674c5; border-color:#1265ac;
+                                              color:white; font-weight:bold; }
+            QPushButton#primaryExportButton:hover { background:#0f67b4; border-color:#0b599d; }
+            QPushButton#primaryExportButton:disabled { background:#d9e0e7; color:#8a929b;
+                                                       border-color:#cbd2d9; }
+            QGroupBox#quickExportGroup QPushButton { padding:4px 8px; }
             QToolButton { background:#ffffff; border:1px solid #c2c7ce; border-radius:3px;
                           color:#1c1e21; }
             QToolButton:checked { background:#ffd8a8; border-color:#e8973a; }
-            QStatusBar { background:#eceff3; color:#4b5057; }
+            QStatusBar { background:#edf1f5; color:#4b535c; }
             QProgressBar { background:#dfe3e8; border:none; }
             QProgressBar::chunk { background:#3b82f6; }
+            QDockWidget#PlateSeriesDock { color:#27313a; font-weight:bold; }
+            QWidget#seriesEditorBar { background:#eef4fb; border:1px solid #cbd9e8;
+                                      border-radius:7px; }
         """)
 
     # ---------- scanning ----------
@@ -1283,6 +1359,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)          # indeterminate
         self.progress_bar.show()
         self._set_actions_enabled(False)
+        if self._plate_series_builder is not None:
+            self._plate_series_builder.setEnabled(False)
         self._scan_worker = ScanWorker(folder, mode)
         self._scan_worker.progress.connect(
             lambda d, n: self.statusBar().showMessage(f"スキャン中 ({n} フォルダ): {d}"))
@@ -1294,10 +1372,25 @@ class MainWindow(QMainWindow):
             if a is not None:
                 a.setEnabled(on)
 
+    def _clear_loaded_experiment(self):
+        self._save_conditions()
+        self._experiment = None
+        self._raw_experiment = None
+        self._current_raw_well = None
+        self._reset_well_state()
+        self.well_plate.set_wells({})
+        self.conditions.set_wells([], {})
+        if self._plate_series_builder is not None:
+            self._plate_series_builder.clear_active_path()
+        self._update_raw_summary()
+        self._update_series_export_state()
+
     def _on_scan_done(self, dirs, errors):
         self.progress_bar.hide()
         self.progress_bar.setRange(0, 1000)
         self._set_actions_enabled(True)
+        if self._plate_series_builder is not None:
+            self._plate_series_builder.setEnabled(True)
         folder, mode = self._pending_root or (None, None)
         if dirs is None:                      # cancelled
             self.statusBar().showMessage("スキャンを中止しました。")
@@ -1324,12 +1417,14 @@ class MainWindow(QMainWindow):
                 "別のフォルダを選ぶか、File ▸ Choose Workflow… で"
                 "もう一方のワークフローをお試しください。")
             return
-        if mode == StartModeDialog.KTF:
-            if self._experiment and Path(self._experiment["path"]) not in set(dirs):
-                self._experiment = None
-                self._reset_well_state()
-                self.well_plate.set_wells({})
-                self.conditions.set_wells([], {})
+        paths = {_path_key(path) for path in dirs}
+        active = self._experiment if mode == StartModeDialog.KTF else self._raw_experiment
+        other_loaded = (
+            self._raw_experiment is not None if mode == StartModeDialog.KTF
+            else self._experiment is not None)
+        if (self._mode is not None and self._mode != mode) or other_loaded or (
+                active is not None and _path_key(active["path"]) not in paths):
+            self._clear_loaded_experiment()
         self._set_mode(mode)
         self.folder_tree.clear()
         if mode == StartModeDialog.KTF:
@@ -1353,6 +1448,9 @@ class MainWindow(QMainWindow):
             self.raw_panel.setVisible(raw)
         if hasattr(self, "ktf_bottom"):
             self.ktf_bottom.setVisible(not raw)
+        if raw and self._plate_series_dock is not None:
+            self._plate_series_dock.hide()
+        self._update_series_export_state()
         self.setWindowTitle(f"{APP_NAME} {__version__} — "
                             + ("生画像（スティッチング）" if raw else ".ktf 表示"))
 
@@ -1420,6 +1518,7 @@ class MainWindow(QMainWindow):
             msg += f" / 使用不可: {', '.join(sorted(unusable))}"
         self.statusBar().showMessage(msg)
         self._update_raw_summary()
+        self._update_series_export_state()
         self._commit_root()
         return True
 
@@ -1452,18 +1551,22 @@ class MainWindow(QMainWindow):
 
     def _select_tree_item(self, path: Path):
         """Highlight the tree row whose stored path matches `path`."""
-        target = str(path)
+        target = _path_key(path)
         stack = [self.folder_tree.topLevelItem(i)
                  for i in range(self.folder_tree.topLevelItemCount())]
         while stack:
             item = stack.pop()
             if item is None:
                 continue
-            if item.data(0, Qt.ItemDataRole.UserRole) == target:
+            stored = item.data(0, Qt.ItemDataRole.UserRole)
+            if stored and _path_key(stored) == target:
                 self.folder_tree.setCurrentItem(item)
                 self.folder_tree.scrollToItem(item)
-                return
+                return True
             stack.extend(item.child(i) for i in range(item.childCount()))
+        self.folder_tree.setCurrentItem(None)
+        self.folder_tree.clearSelection()
+        return False
 
     def _populate_tree(self, root: Path, exp_dirs: list):
         """Show found experiments in a tree, grouped by their parent folder."""
@@ -1529,14 +1632,28 @@ class MainWindow(QMainWindow):
     def _load_experiment(self, folder: Path):
         if self._busy:
             self.statusBar().showMessage("Another operation is running — please wait.")
-            return
-        self.statusBar().showMessage(f"Loading {folder.name}...")
-        QApplication.processEvents()
+            return False
+        self._loading_experiment = True
+        if self._plate_series_builder is not None:
+            self._plate_series_builder.setEnabled(False)
         try:
+            self.statusBar().showMessage(f"Loading {folder.name}...")
+            QApplication.processEvents()
             experiment = ktf_reader.scan_experiment_folder(folder)
         except Exception as e:
             self.statusBar().showMessage(f"Could not read “{folder.name}”: {e}")
-            return
+            return False
+        finally:
+            self._loading_experiment = False
+            if self._plate_series_builder is not None:
+                self._plate_series_builder.setEnabled(True)
+        skipped = experiment.get("errors") or []
+        if not experiment["wells"]:
+            self.statusBar().showMessage(
+                f"No readable wells in “{experiment['name']}”"
+                + (f" ({len(skipped)} file(s) unreadable)" if skipped else ""))
+            return False
+        self._save_conditions()
         self._experiment = experiment
         # A new experiment invalidates everything tied to the previous well.
         self._reset_well_state()
@@ -1546,17 +1663,16 @@ class MainWindow(QMainWindow):
         self.conditions.set_wells(sorted(experiment["wells"]), saved)
 
         msg = f"{experiment['name']}: {len(experiment['wells'])} wells"
-        skipped = experiment.get("errors") or []
         if skipped:
             msg += f" — skipped {len(skipped)} unreadable file(s): " + \
                    ", ".join(n for n, _ in skipped[:3]) + ("…" if len(skipped) > 3 else "")
-        if not experiment["wells"]:
-            msg = f"No readable wells in “{experiment['name']}”" + \
-                  (f" ({len(skipped)} file(s) unreadable)" if skipped else "")
-        else:
-            self._raw_experiment = None       # the two models never coexist
-            self._commit_root()
+        self._raw_experiment = None       # the two models never coexist
+        self._commit_root()
         self.statusBar().showMessage(msg)
+        self._update_series_export_state()
+        if self._plate_series_builder is not None:
+            self._plate_series_builder.set_active_path(folder)
+        return True
 
     def _reset_well_state(self):
         """Drop everything belonging to the previously displayed well."""
@@ -1577,6 +1693,8 @@ class MainWindow(QMainWindow):
         self.canvas.clear_image()
         self.meta_text.clear()
         self.readout.setText("")
+        if self._plate_series_dock is not None and self._plate_series_dock.isVisible():
+            self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
 
     # ---------- sample conditions ----------
     def _active_experiment(self):
@@ -1586,17 +1704,48 @@ class MainWindow(QMainWindow):
     def _conditions_key(self):
         exp = self._active_experiment()
         p = exp["path"] if exp else None
-        return f"conditions/{p}" if p else None
+        return f"conditions/{_path_key(p)}" if p else None
 
-    def _load_conditions(self) -> dict:
-        key = self._conditions_key()
-        if not key:
-            return {}
-        raw = QSettings().value(key, "")
+    @staticmethod
+    def _condition_path_from_key(key):
+        suffix = key[len("conditions/"):]
+        if suffix.startswith(os.sep) or re.match(r"^[A-Za-z]:", suffix):
+            return suffix
+        return os.sep + suffix
+
+    def _matching_condition_keys(self, path):
+        target = _path_key(path)
+        matches = []
+        for key in QSettings().allKeys():
+            if not key.startswith("conditions/"):
+                continue
+            try:
+                if _path_key(self._condition_path_from_key(key)) == target:
+                    matches.append(key)
+            except (OSError, RuntimeError, ValueError):
+                continue
+        return matches
+
+    def _load_conditions_for_path(self, path):
+        settings = QSettings()
+        primary = f"conditions/{_path_key(path)}"
+        raw = settings.value(primary, "")
+        if not raw:
+            for key in self._matching_condition_keys(path):
+                raw = settings.value(key, "")
+                if raw:
+                    settings.setValue(primary, raw)
+                    break
         try:
             return json.loads(raw) if raw else {}
         except (ValueError, TypeError):
             return {}
+
+    def _load_conditions(self) -> dict:
+        exp = self._active_experiment()
+        if not exp:
+            return {}
+        return self._load_conditions_for_path(exp["path"])
 
     def _save_conditions(self):
         """Merge the visible rows into the stored blob.
@@ -1625,7 +1774,9 @@ class MainWindow(QMainWindow):
             return
         key = self._conditions_key()
         if key:
-            QSettings().remove(key)
+            settings = QSettings()
+            for stored_key in set(self._matching_condition_keys(exp["path"])) | {key}:
+                settings.remove(stored_key)
         self.conditions.set_wells(sorted(exp["wells"]), {})
         self.statusBar().showMessage(f"{exp['name']}: サンプル条件を消去しました")
 
@@ -1725,6 +1876,8 @@ class MainWindow(QMainWindow):
             self._rebuild_overview(reset_view=True)
         else:
             self._rebuild_overview(reset_view=False)
+        if self._plate_series_dock is not None and self._plate_series_dock.isVisible():
+            self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
 
     # ---------- compositing ----------
     def _channel_views(self):
@@ -1758,6 +1911,8 @@ class MainWindow(QMainWindow):
     def _on_levels_changed(self):
         self._rebuild_overview(reset_view=False)
         self._refresh_detail()
+        if self._plate_series_dock is not None and self._plate_series_dock.isVisible():
+            self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
 
     def _refresh_detail(self):
         """Load a sharper composite for the current viewport when zoomed in."""
@@ -1855,6 +2010,8 @@ class MainWindow(QMainWindow):
                 ctrl.auto_contrast(self._channel_images[ch_id])
         self._rebuild_overview(reset_view=False)
         self._refresh_detail()
+        if self._plate_series_dock is not None and self._plate_series_dock.isVisible():
+            self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
 
     # ---------- export ----------
     def _export(self, fmt):
@@ -1951,11 +2108,13 @@ class MainWindow(QMainWindow):
     @property
     def _busy(self) -> bool:
         """True while any long operation owns the data (export or stitch)."""
-        return self._exporting or (
+        return self._loading_experiment or self._exporting or (
             self._stitch_worker is not None and self._stitch_worker.isRunning())
 
     def closeEvent(self, event):
         """Don't let a half-written mosaic be left behind on quit."""
+        if self._plate_series_builder is not None:
+            self._plate_series_builder.flush_edits()
         if self._exporting:
             QMessageBox.information(
                 self, "書き出し中です",
@@ -2199,13 +2358,9 @@ class MainWindow(QMainWindow):
     def _conditions_snapshot_for(self, path):
         """Conditions for one experiment without changing the visible table."""
         current = self._experiment["path"] if self._experiment else None
-        if current is not None and Path(current) == Path(path):
+        if current is not None and _path_key(current) == _path_key(path):
             return self._conditions_snapshot()
-        raw = QSettings().value(f"conditions/{Path(path)}", "")
-        try:
-            data = json.loads(raw) if raw else {}
-        except (ValueError, TypeError):
-            data = {}
+        data = self._load_conditions_for_path(path)
         headers = data.get("__headers__") or list(WellConditionsTable.DEFAULT_HEADERS)
         return data, headers
 
@@ -2423,39 +2578,109 @@ class MainWindow(QMainWindow):
         if self._scan_worker is not None and self._scan_worker.isRunning():
             self.statusBar().showMessage("フォルダのスキャン完了後にPDFを書き出してください。")
             return
-        if not self._experiment or not self._experiment["wells"] or self._busy:
+        if self._busy:
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
+            return
+        if not self._experiment or not self._experiment["wells"]:
+            QMessageBox.information(
+                self, "撮影を開いてください",
+                "Series PDF Builderを使う前に、Experimentsから撮影を1件開いてください。")
             return
 
         current_path = Path(self._experiment["path"])
-        current_exp = dict(self._experiment)
-        current_conditions = self._conditions_snapshot()
-        settings = {c: ctrl.to_view() for c, ctrl in self._channel_controls.items()}
-        dlg = PlatePdfDialog(
-            [current_path], current_path, None,
-            list(self.PDF_QUALITY), self)
-        dlg.setStyleSheet("")
-        if not dlg.exec():
+        if self._plate_series_builder.is_empty:
+            self._plate_series_builder.reset(current_path)
+        self._plate_series_builder.set_active_path(current_path)
+        self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
+        was_hidden = not self._plate_series_dock.isVisible()
+        self._plate_series_dock.show()
+        self._plate_series_dock.raise_()
+        if was_hidden:
+            # Show the label editor without sacrificing all plate-detail space.
+            # At the minimum window height the builder's own scroll area remains
+            # the fallback; normal desktop windows open the complete editor.
+            requested = min(540, max(430, int(self.height() * 0.52)))
+            self.resizeDocks(
+                [self._plate_series_dock], [requested], Qt.Orientation.Vertical)
+        self.statusBar().showMessage(
+            "Series PDF Builderで撮影を追加・並べ替えできます。行をクリックすると詳細を表示します。")
+
+    def _activate_series_capture(self, path):
+        path = Path(path)
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self.statusBar().showMessage("フォルダのスキャン完了後に撮影を切り替えてください。")
+            return False
+        if self._busy:
+            self.statusBar().showMessage("処理中は撮影を切り替えられません。")
+            return False
+        mode_changed = self._mode != StartModeDialog.KTF
+        if mode_changed:
+            self._set_mode(StartModeDialog.KTF)
+        current = Path(self._experiment["path"]) if self._experiment else None
+        if mode_changed or current is None or _path_key(current) != _path_key(path):
+            if not self._load_experiment(path):
+                return False
+        self._select_tree_item(path)
+        self.well_tabs.setCurrentIndex(0)
+        self._plate_series_builder.set_active_path(path)
+        self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
+        return True
+
+    def _edit_series_conditions(self, path):
+        if not self._activate_series_capture(path):
             return
-        selected = dlg.selected
-        choice = dlg.quality
+        self.well_tabs.setCurrentWidget(self.cond_tab)
+        self.statusBar().showMessage(
+            "Conditionsを編集しています。変更はこの撮影フォルダに自動保存されます。")
+
+    def _pdf_channel_summary(self):
+        views = [ctrl.to_view() for ctrl in self._channel_controls.values()]
+        if not views:
+            return "全チャンネルを既定色・wellごとの自動レベルで描画"
+        enabled = [view.ch_id for view in views if view.enabled]
+        shown = ", ".join(enabled) if enabled else "なし"
+        return f"現在の表示設定を全撮影に適用（表示: {shown}）"
+
+    def _export_plate_pdf_from_builder(self, selected, quality_spec):
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self.statusBar().showMessage("フォルダのスキャン完了後にPDFを書き出してください。")
+            return
+        if self._busy:
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
+            return
+        selected = [(Path(path), str(label)) for path, label in tuple(selected)]
+        quality_spec = tuple(quality_spec)
+        self._save_conditions()
+        current_path = Path(self._experiment["path"]) if self._experiment else None
+        current_exp = dict(self._experiment) if self._experiment else None
+        current_conditions = self._conditions_snapshot() if self._experiment else None
+        settings = {c: ctrl.to_view() for c, ctrl in self._channel_controls.items()}
         self._exporting = True
+        self._plate_series_builder.set_exporting(True)
+        self._update_series_export_state()
         try:
             self._export_plate_pdf_selection(
-                selected, choice, current_path, current_exp, current_conditions, settings)
+                selected, quality_spec, current_path, current_exp,
+                current_conditions, settings)
         finally:
             self._exporting = False
+            self._plate_series_builder.set_exporting(False)
+            self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
+            self._update_series_export_state()
             self.progress_bar.hide()
 
     def _export_plate_pdf_selection(
             self, selected, choice, current_path, current_exp, current_conditions, settings):
-        source, panel, dpi, layout = self.PDF_QUALITY[choice]
+        source, panel, dpi, layout = (
+            self.PDF_QUALITY[choice] if isinstance(choice, str) else tuple(choice))
 
         series, issues = [], []
         self.statusBar().showMessage(f"{len(selected)} 撮影を確認中…")
         for i, (path, label) in enumerate(selected):
             QApplication.processEvents()
             try:
-                if path == current_path:
+                if (current_path is not None and current_exp is not None
+                        and _path_key(path) == _path_key(current_path)):
                     exp = dict(current_exp)
                     conditions = current_conditions
                 else:
@@ -2918,140 +3143,245 @@ def _ask_save_path(parent, title, default_name, filt, derived=None):
         start = str(path)                # reopen in the same folder, name preselected
 
 
-class PlatePdfDialog(QDialog):
-    """Choose any Stack/time point experiment folders for one PDF."""
+class PlateSeriesBuilder(QWidget):
+    """Build an ordered PDF series while the main plate viewer stays usable."""
 
-    def __init__(self, paths, current, root, quality_labels, parent=None):
+    capture_activated = pyqtSignal(object)
+    conditions_requested = pyqtSignal(object)
+    export_requested = pyqtSignal(object, object)
+
+    PATH_ROLE = Qt.ItemDataRole.UserRole
+    SEARCH_ROLE = Qt.ItemDataRole.UserRole + 1
+    NAME_ROLE = Qt.ItemDataRole.UserRole + 2
+    TIME_ROLE = Qt.ItemDataRole.UserRole + 3
+    STACK_ROLE = Qt.ItemDataRole.UserRole + 4
+    WELLS_ROLE = Qt.ItemDataRole.UserRole + 5
+    CHANNELS_ROLE = Qt.ItemDataRole.UserRole + 6
+
+    def __init__(self, quality_specs, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Plate PDF — Stack / time point")
-        self.setMinimumSize(760, 520)
-        self._current = Path(current)
-        self._current_key = self._path_key(self._current)
-        self._root = Path(root) if root is not None else None
+        self._quality_specs = dict(quality_specs)
         self._items = []
         self._path_items = {}
-        self._last_add_dir = self._current.parent
+        self._series_items = {}
+        self._active_key = None
+        self._active_path = None
+        self._editor_item = None
+        self._last_add_dir = Path.home()
+        self._updating = False
 
         lay = QVBoxLayout(self)
-        intro = QLabel(
-            "同じプレートとしてまとめる撮影フォルダだけを選択してください。"
-            "選択した撮影は、下の順番で1つのPDFに収録されます。")
-        intro.setWordWrap(True)
-        lay.addWidget(intro)
+        lay.setContentsMargins(10, 8, 10, 10)
+        lay.setSpacing(8)
 
-        scope = QLabel(f"現在の撮影: {self._current}")
-        scope.setWordWrap(True)
-        scope.setStyleSheet("color:#1d4ed8; font-size:11px;")
-        lay.addWidget(scope)
+        heading = QHBoxLayout()
+        title = QLabel("<b>撮影シリーズを作成</b>")
+        heading.addWidget(title)
+        note = QLabel("撮影をクリックすると、上のプレート詳細が切り替わります")
+        note.setStyleSheet("color:#6b7280; font-size:11px;")
+        heading.addWidget(note)
+        heading.addStretch()
+        self.btn_new_series = QPushButton("現在の撮影から作り直す")
+        self.btn_new_series.setEnabled(False)
+        self.btn_new_series.setToolTip(
+            "一覧を現在表示中の撮影1件に戻します。保存済みのラベルとConditionsは残ります")
+        self.btn_new_series.clicked.connect(self._reset_to_active)
+        heading.addWidget(self.btn_new_series)
+        lay.addLayout(heading)
 
-        hint = QLabel(
-            "最初は現在の撮影だけが入っています。"
-            "別撮影のStack／time pointは「撮影フォルダを追加…」から1件ずつ追加できます。"
-            "KTFを直接含むフォルダを選んでください（1撮影＝1フォルダ）。"
-            "サブフォルダは検索せず、KTF未生成の撮影は追加できません。"
-            "同一プレートかどうかは自動判定しません。"
-            "絞り込みはフォルダ名と全KTFファイル名を1語の部分一致で検索します。"
-            "必要なら選択後に「上へ／下へ」で時系列順を直してください。")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#6b7280; font-size:11px;")
-        lay.addWidget(hint)
+        editor = QWidget()
+        editor.setObjectName("seriesEditorBar")
+        editor_grid = QGridLayout(editor)
+        editor_grid.setContentsMargins(9, 6, 9, 5)
+        editor_grid.setHorizontalSpacing(7)
+        editor_grid.setVerticalSpacing(2)
+        editor_grid.addWidget(QLabel("<b>選択中</b>"), 0, 0)
+        self.ed_name = QLineEdit()
+        self.ed_time = QLineEdit()
+        self.ed_stack = QLineEdit()
+        self.ed_time.setPlaceholderText("例: Day 7")
+        self.ed_stack.setPlaceholderText("例: Stack 1")
+        for column, (label, field) in enumerate((
+                ("撮影名", self.ed_name),
+                ("Time point", self.ed_time),
+                ("Stack", self.ed_stack)), start=1):
+            editor_grid.addWidget(QLabel(label), 0, column * 2 - 1)
+            field.editingFinished.connect(self._save_editor)
+            editor_grid.addWidget(field, 0, column * 2)
+        editor_grid.setColumnStretch(2, 3)
+        editor_grid.setColumnStretch(4, 2)
+        editor_grid.setColumnStretch(6, 2)
+        self.btn_conditions = QPushButton("この撮影のConditionsを編集")
+        self.btn_conditions.clicked.connect(self._request_conditions)
+        editor_grid.addWidget(self.btn_conditions, 0, 7)
+        self.lbl_path = QLabel()
+        self.lbl_path.setWordWrap(False)
+        self.lbl_path.setMinimumWidth(0)
+        self.lbl_path.setStyleSheet("color:#4b5563; font-family:Menlo; font-size:9px;")
+        editor_grid.addWidget(self.lbl_path, 1, 1, 1, 6)
+        self.lbl_editor = QLabel("名前はPDFの撮影タイトルに使われます")
+        self.lbl_editor.setStyleSheet("color:#6b7280; font-size:10px;")
+        editor_grid.addWidget(self.lbl_editor, 1, 7)
+        lay.addWidget(editor)
 
-        add_row = QHBoxLayout()
+        panes = QSplitter(Qt.Orientation.Horizontal)
+        panes.setChildrenCollapsible(False)
+
+        source_host = QWidget()
+        source_lay = QVBoxLayout(source_host)
+        source_lay.setContentsMargins(0, 0, 6, 0)
+        source_head = QHBoxLayout()
+        source_head.addWidget(QLabel("<b>追加済みの撮影</b>"))
         self.btn_add_folder = QPushButton("＋ 撮影フォルダを追加…")
         self.btn_add_folder.clicked.connect(self._add_capture_folder)
-        add_row.addWidget(self.btn_add_folder)
-        add_note = QLabel("別々の場所にある撮影も追加できます")
-        add_note.setStyleSheet("color:#6b7280; font-size:11px;")
-        add_row.addWidget(add_note)
-        add_row.addStretch()
-        lay.addLayout(add_row)
-
-        filters = QHBoxLayout()
-        filters.addWidget(QLabel("絞り込み:"))
+        add_visible = QPushButton("絞り込み結果を追加")
+        add_visible.setToolTip("現在表示されている撮影をPDFの末尾へ追加します")
+        add_visible.clicked.connect(self._include_visible)
+        clear_all = QPushButton("すべて外す")
+        clear_all.setToolTip("追加済みの撮影は残し、PDFの収録対象からすべて外します")
+        clear_all.clicked.connect(self._exclude_all)
+        source_head.addStretch()
+        source_head.addWidget(self.btn_add_folder)
+        source_head.addWidget(add_visible)
+        source_head.addWidget(clear_all)
+        source_lay.addLayout(source_head)
         self.ed_filter = QLineEdit()
-        self.ed_filter.setPlaceholderText("例: Day7 または Stack1（1語）")
+        self.ed_filter.setPlaceholderText("名前・Time point・Stack・KTF名を絞り込み")
         self.ed_filter.textChanged.connect(self._filter_items)
-        filters.addWidget(self.ed_filter, stretch=1)
-        lay.addLayout(filters)
+        source_lay.addWidget(self.ed_filter)
+        self.source_tree = QTreeWidget()
+        self.source_tree.setHeaderLabels(
+            ["撮影名", "Time point", "Stack", "Wells", "Channels"])
+        self.source_tree.setRootIsDecorated(False)
+        self.source_tree.setAlternatingRowColors(True)
+        self.source_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.source_tree.setMinimumHeight(55)
+        self.source_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.source_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        for column in range(1, 5):
+            self.source_tree.header().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents)
+        self.source_tree.itemChanged.connect(self._source_item_changed)
+        self.source_tree.itemClicked.connect(self._source_item_clicked)
+        source_lay.addWidget(self.source_tree, stretch=1)
+        panes.addWidget(source_host)
 
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(
-            ["撮影フォルダ（Stack / time point）", "KTFファイル名の例", "Wells", "Channels"])
-        self.tree.setRootIsDecorated(False)
-        self.tree.setAlternatingRowColors(True)
-        for path in paths:
-            path = Path(path)
-            key = self._path_key(path)
-            self._add_path_item(
-                path, checked=(key == self._current_key),
-                focus=(key == self._current_key))
-        self.tree.resizeColumnToContents(0)
-        self.tree.resizeColumnToContents(1)
-        self.tree.resizeColumnToContents(2)
-        self.tree.resizeColumnToContents(3)
-        self.tree.itemChanged.connect(self._update_selection_label)
-        lay.addWidget(self.tree, stretch=1)
-
-        selects = QHBoxLayout()
-        for label, slot in [
-            ("現在のみ", self._select_current_only),
-            ("絞り込み結果だけ選択", self._select_filtered_only),
-            ("一覧を全選択", self._select_all),
-            ("選択解除", self._select_none),
-        ]:
-            btn = QPushButton(label)
-            btn.clicked.connect(slot)
-            selects.addWidget(btn)
+        series_host = QWidget()
+        series_lay = QVBoxLayout(series_host)
+        series_lay.setContentsMargins(6, 0, 0, 0)
+        series_head = QHBoxLayout()
+        series_head.addWidget(QLabel("<b>PDFに含める順序</b>"))
+        series_head.addStretch()
         self.btn_up = QPushButton("↑ 上へ")
-        self.btn_up.clicked.connect(lambda: self._move_current(-1))
-        selects.addWidget(self.btn_up)
         self.btn_down = QPushButton("↓ 下へ")
+        self.btn_remove = QPushButton("外す")
+        self.btn_up.clicked.connect(lambda: self._move_current(-1))
         self.btn_down.clicked.connect(lambda: self._move_current(1))
-        selects.addWidget(self.btn_down)
-        selects.addStretch()
-        lay.addLayout(selects)
+        self.btn_remove.clicked.connect(self._remove_current)
+        for button in (self.btn_up, self.btn_down, self.btn_remove):
+            series_head.addWidget(button)
+        series_lay.addLayout(series_head)
+        self.series_tree = QTreeWidget()
+        self.series_tree.setHeaderLabels(["順序", "撮影名", "Time point", "Stack"])
+        self.series_tree.setRootIsDecorated(False)
+        self.series_tree.setAlternatingRowColors(True)
+        self.series_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.series_tree.setMinimumHeight(55)
+        self.series_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.series_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        self.series_tree.header().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3):
+            self.series_tree.header().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents)
+        self.series_tree.itemClicked.connect(self._series_item_clicked)
+        series_lay.addWidget(self.series_tree, stretch=1)
+        panes.addWidget(series_host)
+        panes.setSizes([620, 620])
+        panes.setMinimumHeight(85)
+        lay.addWidget(panes, stretch=1)
 
-        self.lbl_selected = QLabel()
-        self.lbl_selected.setStyleSheet("color:#6b7280; font-size:11px;")
-        lay.addWidget(self.lbl_selected)
-        self._update_selection_label()
-
-        quality_row = QHBoxLayout()
-        quality_row.addWidget(QLabel("画質・ページ構成:"))
+        settings = QGroupBox("PDF書き出し設定")
+        settings_grid = QGridLayout(settings)
+        settings_grid.setContentsMargins(8, 8, 8, 6)
+        settings_grid.setHorizontalSpacing(8)
+        settings_grid.setVerticalSpacing(2)
+        settings_grid.addWidget(QLabel("画質・ページ構成"), 0, 0)
         self.cmb_quality = QComboBox()
-        self.cmb_quality.addItems(quality_labels)
-        self.cmb_quality.setCurrentIndex(min(2, len(quality_labels) - 1))
-        quality_row.addWidget(self.cmb_quality, stretch=1)
-        lay.addLayout(quality_row)
+        self.cmb_quality.setFixedHeight(28)
+        for label, spec in self._quality_specs.items():
+            self.cmb_quality.addItem(label, tuple(spec))
+        self.cmb_quality.setCurrentIndex(min(2, self.cmb_quality.count() - 1))
+        self.cmb_quality.currentIndexChanged.connect(self._update_export_summary)
+        settings_grid.addWidget(self.cmb_quality, 0, 1, 1, 2)
+        self.lbl_quality = QLabel()
+        self.lbl_quality.setStyleSheet("color:#4b5563; font-size:11px;")
+        settings_grid.addWidget(self.lbl_quality, 1, 1, 1, 2)
+        settings_grid.addWidget(QLabel("チャンネル表示"), 2, 0)
+        self.lbl_channels = QLabel("全チャンネルを既定値で描画")
+        self.lbl_channels.setMinimumWidth(0)
+        settings_grid.addWidget(self.lbl_channels, 2, 1)
+        settings_grid.addWidget(QLabel("Conditions"), 2, 2)
+        settings_grid.addWidget(
+            QLabel("撮影ごとの保存内容をwellへ印字"), 2, 3)
+        settings_grid.addWidget(QLabel("保存先"), 2, 4)
+        settings_grid.addWidget(
+            QLabel("書き出し時に指定（置換前に確認）"), 2, 5)
+        settings_grid.setColumnStretch(1, 4)
+        settings_grid.setColumnStretch(3, 2)
+        settings_grid.setColumnStretch(5, 2)
+        lay.addWidget(settings)
 
-        box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        box.button(QDialogButtonBox.StandardButton.Save).setText("PDFを書き出す")
-        box.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
-        box.accepted.connect(self.accept)
-        box.rejected.connect(self.reject)
-        lay.addWidget(box)
+        actions = QHBoxLayout()
+        self.lbl_summary = QLabel()
+        self.lbl_summary.setStyleSheet("color:#4b5563;")
+        actions.addWidget(self.lbl_summary)
+        actions.addStretch()
+        self.btn_export = QPushButton("シリーズPDFを書き出す")
+        self.btn_export.setObjectName("primaryExportButton")
+        self.btn_export.clicked.connect(self._request_export)
+        actions.addWidget(self.btn_export)
+        lay.addLayout(actions)
+        self._set_editor_item(None)
+        self._update_export_summary()
+
+    @property
+    def is_empty(self):
+        return not self._items
 
     @staticmethod
     def _path_key(path):
-        return os.path.normcase(str(Path(path).resolve()))
+        return _path_key(path)
 
-    def _label(self, path):
-        if self._root is not None:
-            try:
-                rel = path.relative_to(self._root)
-                if rel.parts:
-                    return str(rel)
-            except ValueError:
-                pass
+    @classmethod
+    def _labels_key(cls, path):
+        return f"plate_series_labels/{cls._path_key(path)}"
+
+    def _load_labels(self, path):
+        raw = QSettings().value(self._labels_key(path), "")
+        try:
+            data = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def _store_labels(self, item):
+        path = Path(item.data(0, self.PATH_ROLE))
+        data = {
+            "name": item.data(0, self.NAME_ROLE),
+            "time_point": item.data(0, self.TIME_ROLE),
+            "stack": item.data(0, self.STACK_ROLE),
+        }
+        QSettings().setValue(self._labels_key(path), json.dumps(data, ensure_ascii=False))
+
+    def _default_label(self, path):
         return str(Path(path.parent.name) / path.name)
 
-    def _unique_export_label(self, path):
-        label = self._label(path)
-        used = {
-            item.data(0, Qt.ItemDataRole.UserRole + 2)
-            for item in self._items
-        }
+    def _unique_default_label(self, path):
+        label = self._default_label(path)
+        used = {str(item.data(0, self.NAME_ROLE)) for item in self._items}
         if label not in used:
             return label
         parts = path.parts
@@ -3061,16 +3391,44 @@ class PlatePdfDialog(QDialog):
                 return candidate
         return str(path)
 
-    def _add_path_item(self, path, checked=False, focus=False, require_ktf=False):
+    def reset(self, current):
+        self._updating = True
+        self.source_tree.clear()
+        self.series_tree.clear()
+        self._items.clear()
+        self._path_items.clear()
+        self._series_items.clear()
+        self._active_key = None
+        self._active_path = None
+        self._editor_item = None
+        self._updating = False
+        current = Path(current)
+        self._last_add_dir = current.parent
+        self.ensure_capture(current, include=True, focus=True)
+        self.set_active_path(current)
+
+    def ensure_capture(self, path, include=False, focus=False):
+        path = Path(path)
+        key = self._path_key(path)
+        item = self._path_items.get(key)
+        if item is None:
+            item = self._add_path_item(path, checked=include, require_ktf=False)
+        elif include and item.checkState(0) != Qt.CheckState.Checked:
+            item.setCheckState(0, Qt.CheckState.Checked)
+        if item is not None and focus:
+            self.source_tree.setCurrentItem(item)
+            self.source_tree.scrollToItem(item)
+            self._set_editor_item(item)
+        return item
+
+    def _add_path_item(self, path, checked=True, require_ktf=True):
         path = Path(path)
         key = self._path_key(path)
         existing = self._path_items.get(key)
         if existing is not None:
-            if checked:
-                existing.setCheckState(0, Qt.CheckState.Checked)
-            if focus:
-                self.tree.setCurrentItem(existing)
-                self.tree.scrollToItem(existing)
+            existing.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            self.source_tree.setCurrentItem(existing)
+            self._set_editor_item(existing)
             return existing
 
         example, wells, channels, search_text = self._source_info(path)
@@ -3083,58 +3441,57 @@ class PlatePdfDialog(QDialog):
             return None
         if require_ktf:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            scan_error = None
             try:
                 experiment = ktf_reader.scan_experiment_folder(path)
             except Exception as e:
-                scan_error = e
-            finally:
-                QApplication.restoreOverrideCursor()
-            if scan_error is not None:
                 QMessageBox.warning(
                     self, "撮影フォルダを読み込めません",
-                    f"“{path}” を読み込めませんでした。\n\n"
-                    f"{_friendly_error(scan_error)}")
+                    f"“{path}” を読み込めませんでした。\n\n{_friendly_error(e)}")
                 return None
+            finally:
+                QApplication.restoreOverrideCursor()
             if not experiment["wells"]:
-                detail = ""
-                if experiment.get("errors"):
-                    detail = f"\n\n読取不能なKTF: {len(experiment['errors'])} 件"
+                detail = (f"\n\n読取不能なKTF: {len(experiment.get('errors') or [])} 件"
+                          if experiment.get("errors") else "")
                 QMessageBox.warning(
                     self, "読み取れるKTFがありません",
                     f"“{path}” には読み取れるwell画像がありません。{detail}")
                 return None
             wells = len(experiment["wells"])
             channel_ids = {
-                channel
-                for per_well in experiment["wells"].values()
-                for channel in per_well
-            }
+                channel for per_well in experiment["wells"].values() for channel in per_well}
             channels = ", ".join(sorted(channel_ids))
             partial_errors = experiment.get("errors") or []
 
-        label = self._unique_export_label(path)
-        item = QTreeWidgetItem(self.tree)
-        item.setText(0, label)
-        item.setText(1, ("⚠ " if partial_errors else "") + example)
-        item.setText(2, str(wells))
-        item.setText(3, channels)
-        item.setToolTip(0, str(path))
-        item.setData(0, Qt.ItemDataRole.UserRole, str(path))
-        item.setData(0, Qt.ItemDataRole.UserRole + 1, f"{path} {search_text}")
-        item.setData(0, Qt.ItemDataRole.UserRole + 2, label)
-        if partial_errors:
-            item.setToolTip(
-                1, f"{len(partial_errors)} 件のKTFを読み取れません。"
-                "PDF書き出し前にもう一度確認します。")
+        saved = self._load_labels(path)
+        name = str(saved.get("name") or self._unique_default_label(path))
+        time_point = str(saved.get("time_point") or "")
+        stack = str(saved.get("stack") or "")
+        self._updating = True
+        item = QTreeWidgetItem(self.source_tree)
+        item.setText(0, name)
+        item.setText(1, time_point)
+        item.setText(2, stack)
+        item.setText(3, str(wells))
+        item.setText(4, channels)
+        item.setToolTip(0, f"{path}\nKTF: {example}" + (
+            f"\n⚠ 読取不能: {len(partial_errors)} 件" if partial_errors else ""))
+        item.setData(0, self.PATH_ROLE, str(path))
+        item.setData(0, self.SEARCH_ROLE, f"{path} {search_text}")
+        item.setData(0, self.NAME_ROLE, name)
+        item.setData(0, self.TIME_ROLE, time_point)
+        item.setData(0, self.STACK_ROLE, stack)
+        item.setData(0, self.WELLS_ROLE, int(wells))
+        item.setData(0, self.CHANNELS_ROLE, channels)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         self._items.append(item)
         self._path_items[key] = item
-        item.setCheckState(
-            0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-        if focus:
-            self.tree.setCurrentItem(item)
-            self.tree.scrollToItem(item)
+        item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self._updating = False
+        if checked:
+            self._set_included(item, True)
+        self.source_tree.setCurrentItem(item)
+        self._set_editor_item(item)
         if partial_errors:
             QMessageBox.warning(
                 self, "一部のKTFを読み取れません",
@@ -3144,33 +3501,174 @@ class PlatePdfDialog(QDialog):
 
     def _add_capture_folder(self):
         chosen = QFileDialog.getExistingDirectory(
-            self, "Stack / time point の撮影フォルダを追加",
-            str(self._last_add_dir))
+            self, "Stack / time point の撮影フォルダを追加", str(self._last_add_dir))
         if not chosen:
             return
         path = Path(chosen)
         self._last_add_dir = path.parent
         self.ed_filter.clear()
-        item = self._add_path_item(path, checked=True, focus=True, require_ktf=True)
+        item = self._add_path_item(path, checked=True, require_ktf=True)
         if item is not None:
-            for column in range(4):
-                self.tree.resizeColumnToContents(column)
-            self._update_selection_label()
+            self.lbl_editor.setText("追加しました。行をクリックするとプレート詳細を表示します")
+
+    def _reset_to_active(self):
+        if self._active_path is None:
+            return
+        if len(self._items) > 1:
+            ans = QMessageBox.question(
+                self, "シリーズを作り直す",
+                "撮影一覧とPDF順序を、現在表示中の撮影1件に戻しますか？\n\n"
+                "保存済みの撮影ラベルとConditionsは削除されません。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        self.reset(self._active_path)
+
+    def _source_item_changed(self, item, column):
+        if self._updating or column != 0:
+            return
+        key = self._path_key(item.data(0, self.PATH_ROLE))
+        included = item.checkState(0) == Qt.CheckState.Checked
+        if included != (key in self._series_items):
+            self._set_included(item, included)
+
+    def _set_included(self, source_item, included):
+        key = self._path_key(source_item.data(0, self.PATH_ROLE))
+        series_item = self._series_items.get(key)
+        if included and series_item is None:
+            series_item = QTreeWidgetItem(self.series_tree)
+            series_item.setData(0, self.PATH_ROLE, source_item.data(0, self.PATH_ROLE))
+            self._series_items[key] = series_item
+            self._refresh_series_item(source_item)
+            self.series_tree.setCurrentItem(series_item)
+        elif not included and series_item is not None:
+            index = self.series_tree.indexOfTopLevelItem(series_item)
+            if index >= 0:
+                self.series_tree.takeTopLevelItem(index)
+            self._series_items.pop(key, None)
+        self._renumber_series()
+        self._update_export_summary()
+
+    def _refresh_series_item(self, source_item):
+        key = self._path_key(source_item.data(0, self.PATH_ROLE))
+        item = self._series_items.get(key)
+        if item is None:
+            return
+        item.setText(1, str(source_item.data(0, self.NAME_ROLE) or ""))
+        item.setText(2, str(source_item.data(0, self.TIME_ROLE) or ""))
+        item.setText(3, str(source_item.data(0, self.STACK_ROLE) or ""))
+        item.setToolTip(1, source_item.toolTip(0))
+
+    def _renumber_series(self):
+        for index in range(self.series_tree.topLevelItemCount()):
+            self.series_tree.topLevelItem(index).setText(0, str(index + 1))
+
+    def _source_item_clicked(self, item, _column):
+        if self._editor_item is not item:
+            self._save_editor()
+        self._set_editor_item(item)
+        self.capture_activated.emit(Path(item.data(0, self.PATH_ROLE)))
+
+    def _series_item_clicked(self, item, _column):
+        key = self._path_key(item.data(0, self.PATH_ROLE))
+        source = self._path_items.get(key)
+        if source is None:
+            return
+        if self._editor_item is not source:
+            self._save_editor()
+        self.source_tree.setCurrentItem(source)
+        self._set_editor_item(source)
+        self.capture_activated.emit(Path(source.data(0, self.PATH_ROLE)))
+
+    def _set_editor_item(self, item):
+        self._editor_item = item
+        enabled = item is not None
+        for field in (self.ed_name, self.ed_time, self.ed_stack):
+            field.setEnabled(enabled)
+        self.btn_conditions.setEnabled(enabled)
+        self.ed_name.setText(str(item.data(0, self.NAME_ROLE) or "") if item else "")
+        self.ed_time.setText(str(item.data(0, self.TIME_ROLE) or "") if item else "")
+        self.ed_stack.setText(str(item.data(0, self.STACK_ROLE) or "") if item else "")
+        self.lbl_path.setText(str(item.data(0, self.PATH_ROLE) or "") if item else "")
+        self.lbl_path.setToolTip(str(item.data(0, self.PATH_ROLE) or "") if item else "")
+        self.lbl_editor.setText(
+            "名前・Time point・StackはPDFの撮影タイトルに使われます"
+            if item else "左または右の撮影を選択してください")
+
+    def _save_editor(self):
+        item = self._editor_item
+        if item is None:
+            return
+        name = self.ed_name.text().strip()
+        if not name:
+            name = str(item.data(0, self.NAME_ROLE) or "")
+            self.ed_name.setText(name)
+            self.lbl_editor.setText("撮影名は空にできません")
+            return
+        time_point = self.ed_time.text().strip()
+        stack = self.ed_stack.text().strip()
+        self._updating = True
+        item.setData(0, self.NAME_ROLE, name)
+        item.setData(0, self.TIME_ROLE, time_point)
+        item.setData(0, self.STACK_ROLE, stack)
+        item.setText(0, name)
+        item.setText(1, time_point)
+        item.setText(2, stack)
+        self._updating = False
+        self._store_labels(item)
+        self._refresh_series_item(item)
+        self._update_export_summary()
+        self.lbl_editor.setText("ラベルを保存しました")
+
+    def _request_conditions(self):
+        if self._editor_item is None:
+            return
+        self._save_editor()
+        self.conditions_requested.emit(Path(self._editor_item.data(0, self.PATH_ROLE)))
+
+    def _move_current(self, delta):
+        item = self.series_tree.currentItem()
+        if item is None:
+            return
+        index = self.series_tree.indexOfTopLevelItem(item)
+        target = index + delta
+        if index < 0 or target < 0 or target >= self.series_tree.topLevelItemCount():
+            return
+        item = self.series_tree.takeTopLevelItem(index)
+        self.series_tree.insertTopLevelItem(target, item)
+        self.series_tree.setCurrentItem(item)
+        self._renumber_series()
+        self._update_export_summary()
+
+    def _remove_current(self):
+        item = self.series_tree.currentItem()
+        if item is None:
+            return
+        key = self._path_key(item.data(0, self.PATH_ROLE))
+        source = self._path_items.get(key)
+        if source is not None:
+            source.setCheckState(0, Qt.CheckState.Unchecked)
+
+    def _include_visible(self):
+        for item in self._items:
+            if not item.isHidden():
+                item.setCheckState(0, Qt.CheckState.Checked)
+
+    def _exclude_all(self):
+        for item in self._items:
+            item.setCheckState(0, Qt.CheckState.Unchecked)
 
     def _filter_items(self, text):
         needle = text.strip().casefold()
         for item in self._items:
-            haystack = (
-                f"{item.text(0)} "
-                f"{item.data(0, Qt.ItemDataRole.UserRole + 1) or ''}").casefold()
+            haystack = " ".join([
+                item.text(0), item.text(1), item.text(2),
+                str(item.data(0, self.SEARCH_ROLE) or "")]).casefold()
             matched = not needle or needle in haystack
             if matched and needle and needle[-1].isdigit():
                 matched = re.search(re.escape(needle) + r"(?!\d)", haystack) is not None
             item.setHidden(not matched)
-        if hasattr(self, "btn_up"):
-            self.btn_up.setEnabled(not needle)
-            self.btn_down.setEnabled(not needle)
-        self._update_selection_label()
 
     @staticmethod
     def _source_info(path):
@@ -3190,79 +3688,114 @@ class PlatePdfDialog(QDialog):
         example = min(names, key=_natural_key) if names else ""
         return example, len(wells), ", ".join(sorted(channels)), " ".join(names)
 
-    def _select_current_only(self):
-        for item in self._items:
-            item.setCheckState(
-                0, Qt.CheckState.Checked
-                if self._path_key(item.data(0, Qt.ItemDataRole.UserRole)) == self._current_key
-                else Qt.CheckState.Unchecked)
-
-    def _select_filtered_only(self):
-        for item in self._items:
-            item.setCheckState(
-                0, Qt.CheckState.Unchecked if item.isHidden() else Qt.CheckState.Checked)
-
-    def _select_all(self):
-        for item in self._items:
-            item.setCheckState(0, Qt.CheckState.Checked)
-
-    def _select_none(self):
-        for item in self._items:
-            item.setCheckState(0, Qt.CheckState.Unchecked)
-
-    def _move_current(self, delta):
-        if any(item.isHidden() for item in self._items):
-            return
-        item = self.tree.currentItem()
-        if item is None:
-            return
-        index = self.tree.indexOfTopLevelItem(item)
-        target = index + delta
-        if index < 0 or target < 0 or target >= self.tree.topLevelItemCount():
-            return
-        item = self.tree.takeTopLevelItem(index)
-        self.tree.insertTopLevelItem(target, item)
-        self.tree.setCurrentItem(item)
-
-    def _update_selection_label(self):
-        selected = self.selected
-        hidden = sum(item.isHidden() and item.checkState(0) == Qt.CheckState.Checked
-                     for item in self._items)
-        suffix = f"（絞り込みで非表示: {hidden}）" if hidden else ""
-        self.lbl_selected.setText(f"選択中: {len(selected)} 撮影 {suffix}")
+    @staticmethod
+    def _compose_label(item):
+        parts = [str(item.data(0, PlateSeriesBuilder.NAME_ROLE) or "").strip()]
+        time_point = str(item.data(0, PlateSeriesBuilder.TIME_ROLE) or "").strip()
+        stack = str(item.data(0, PlateSeriesBuilder.STACK_ROLE) or "").strip()
+        if time_point:
+            parts.append(f"Time point: {time_point}")
+        if stack:
+            parts.append(f"Stack: {stack}")
+        return " · ".join(part for part in parts if part)
 
     @property
     def selected(self):
         out = []
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            if item.checkState(0) == Qt.CheckState.Checked:
-                out.append((
-                    Path(item.data(0, Qt.ItemDataRole.UserRole)),
-                    item.data(0, Qt.ItemDataRole.UserRole + 2)))
+        for index in range(self.series_tree.topLevelItemCount()):
+            series_item = self.series_tree.topLevelItem(index)
+            key = self._path_key(series_item.data(0, self.PATH_ROLE))
+            source = self._path_items.get(key)
+            if source is not None:
+                out.append((Path(source.data(0, self.PATH_ROLE)), self._compose_label(source)))
         return out
 
     @property
-    def quality(self):
-        return self.cmb_quality.currentText()
+    def quality_spec(self):
+        return tuple(self.cmb_quality.currentData())
 
-    def accept(self):
-        if not self.selected:
-            QMessageBox.warning(self, "撮影が選ばれていません",
-                                "PDFに含める撮影を1つ以上選択してください。")
+    def _quality_description(self):
+        source, panel, dpi, layout = self.quality_spec
+        source_text = "埋め込みthumbnail" if source == "thumb" else "full KTF"
+        size_text = "原寸" if panel == 0 else f"約{panel} px / well"
+        layout_text = {
+            "grid": "撮影ごとにoverview 1ページ",
+            "pages": "wellごとに1ページ",
+            "both": "overview＋well別ページ",
+        }[layout]
+        return f"{source_text} · {size_text} · {dpi} DPI · {layout_text}"
+
+    def _update_export_summary(self):
+        if not hasattr(self, "lbl_summary"):
             return
-        hidden = [item for item in self._items
-                  if item.isHidden() and item.checkState(0) == Qt.CheckState.Checked]
-        if hidden:
-            ans = QMessageBox.question(
-                self, "非表示の撮影も選択されています",
-                f"絞り込みで見えていない撮影が {len(hidden)} 件選択されています。"
-                "それらもPDFに含めますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if ans != QMessageBox.StandardButton.Yes:
-                return
-        super().accept()
+        selected = self.selected
+        wells = sum(int(self._path_items[self._path_key(path)].data(0, self.WELLS_ROLE) or 0)
+                    for path, _label in selected)
+        layout = self.quality_spec[3] if self.cmb_quality.count() else "grid"
+        pages = len(selected) if layout == "grid" else wells
+        if layout == "both":
+            pages += len(selected)
+        self.lbl_summary.setText(
+            f"{len(selected)}撮影 · {wells} wells · 推定{pages}ページ")
+        self.lbl_quality.setText(self._quality_description())
+        self.btn_export.setEnabled(bool(selected))
+
+    def set_channel_summary(self, text):
+        self.lbl_channels.setText(text)
+
+    def set_active_path(self, path):
+        self._active_path = Path(path)
+        self.btn_new_series.setEnabled(True)
+        key = self._path_key(path)
+        self._active_key = key
+        self._updating = True
+        for item in self._items:
+            item_key = self._path_key(item.data(0, self.PATH_ROLE))
+            bold = item_key == key
+            for column in range(5):
+                font = item.font(column)
+                font.setBold(bold)
+                item.setFont(column, font)
+        self._updating = False
+        for item_key, item in self._series_items.items():
+            bold = item_key == key
+            for column in range(4):
+                font = item.font(column)
+                font.setBold(bold)
+                item.setFont(column, font)
+
+    def clear_active_path(self):
+        self._active_path = None
+        self._active_key = None
+        self.btn_new_series.setEnabled(False)
+        self._updating = True
+        for item in self._items:
+            for column in range(5):
+                font = item.font(column)
+                font.setBold(False)
+                item.setFont(column, font)
+        for item in self._series_items.values():
+            for column in range(4):
+                font = item.font(column)
+                font.setBold(False)
+                item.setFont(column, font)
+        self._updating = False
+
+    def set_exporting(self, exporting):
+        self.setEnabled(not exporting)
+
+    def flush_edits(self):
+        self._save_editor()
+
+    def _request_export(self):
+        self._save_editor()
+        selected = tuple(self.selected)
+        if not selected:
+            QMessageBox.warning(
+                self, "撮影が選ばれていません",
+                "PDFに含める撮影を1つ以上追加してください。")
+            return
+        self.export_requested.emit(selected, self.quality_spec)
 
 
 class OutputTargetDialog(QDialog):
