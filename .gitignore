@@ -27,6 +27,7 @@ Thumbs.db
 sample_data/*.ktf
 scratchpad/
 synthetic/
+work/
 
 # Agent handoff notes — local only. HANDOFF.md in particular names real
 # experiment folders and drive paths; neither belongs on the public repo.

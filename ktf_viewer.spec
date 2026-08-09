@@ -4,7 +4,9 @@
 import os
 import sys
 
-APP_NAME = "BZ Plate Studio"
+from PyInstaller.utils.hooks import collect_submodules
+
+APP_NAME = "BZ Studio"
 _ICON = "app_icon.icns" if sys.platform == "darwin" else "app_icon.ico"
 ICON = _ICON if os.path.exists(_ICON) else None  # optional; add later for a custom icon
 
@@ -13,7 +15,12 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    # imagecodecs resolves the compiled codec modules lazily with importlib.
+    # PyInstaller cannot discover those imports from the module graph, yet the
+    # ordinary-image workflow needs them for LZW input and compressed OME-TIFF
+    # output.  Bundle the codec modules explicitly and verify them in the
+    # packaged-app smoke test.
+    hiddenimports=collect_submodules("imagecodecs"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -59,6 +66,7 @@ if sys.platform == "darwin":
         bundle_identifier="io.github.ktf-viewer",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "1.6.0",
+            "CFBundleShortVersionString": "2.0.0",
+            "CFBundleVersion": "2.0.0",
         },
     )

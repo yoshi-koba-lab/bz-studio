@@ -7,5 +7,8 @@ mirrored in the packaging metadata. Semantic versioning — MAJOR.MINOR.PATCH:
   PATCH  ordinary updates: fixes and small improvements (the usual bump)
 """
 
-__version__ = "1.6.0"
-APP_NAME = "BZ Plate Studio"
+__version__ = "2.0.0"
+APP_NAME = "BZ Studio"
+# Keep the established QSettings namespace so upgrading does not hide saved
+# Conditions, recent folders, or Series Builder labels.
+SETTINGS_APP_NAME = "BZ Plate Studio"

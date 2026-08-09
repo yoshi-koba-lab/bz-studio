@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bz-plate-studio"
-version = "1.6.0"
-description = "Well-plate viewer and tile stitcher for BZ-X microscope images"
+name = "bz-studio"
+version = "2.0.0"
+description = "Wide-area microscopy mosaic, plate-image, and KTF desktop studio"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Proprietary — All Rights Reserved" }
@@ -24,6 +24,8 @@ dependencies = [
     "numpy>=1.24",
     "Pillow>=10.0",
     "tifffile>=2023.7",
+    "imagecodecs>=2024.1",
+    "scipy>=1.11",
 ]
 
 [project.urls]
@@ -31,7 +33,8 @@ Homepage = "https://github.com/yoshi-koba-lab/bz-plate-studio"
 Issues = "https://github.com/yoshi-koba-lab/bz-plate-studio/issues"
 
 [project.gui-scripts]
+bz-studio = "main:main"
 bz-plate-studio = "main:main"
 
 [tool.setuptools]
-py-modules = ["main", "ktf_reader", "render", "stitcher", "version"]
+py-modules = ["main", "ktf_reader", "render", "stitcher", "mosaic", "mosaic_engine", "mosaic_ui", "version"]

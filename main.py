@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KTF Viewer — desktop app for viewing .ktf microscope images.
+"""BZ Studio — wide-area mosaics, plate images, and .ktf viewing.
 
 Features: well-plate browser, multi-channel pseudocolor compositing, full-resolution
 detail-on-zoom, real-world scale bar, cursor readout (stage position + intensity),
@@ -58,7 +58,13 @@ from PyQt6.QtGui import (
 import ktf_reader
 import render
 import stitcher
-from version import __version__, APP_NAME
+import mosaic
+import mosaic_engine
+from mosaic_ui import (
+    MosaicBuildWorker, MosaicDetailWorker, MosaicExportWorker,
+    MosaicMetadataWorker, MosaicWorkspace,
+)
+from version import __version__, APP_NAME, SETTINGS_APP_NAME
 
 # Default pseudocolor per channel id
 CHANNEL_COLORS = {
@@ -119,6 +125,8 @@ class ImageCanvas(QWidget):
         self._full_w = 0
         self._full_h = 0
         self._um_per_px_full = 0.0
+        self._custom_scale_bar = None
+        self._empty_message = "画像セットを開いてください"
 
         self._detail_pixmap = None         # QPixmap covering a sub-rect at higher res
         self._detail_rect_full = None      # QRect in full-res image coords
@@ -190,6 +198,16 @@ class ImageCanvas(QWidget):
         self.zoom_edit.hide()
         self.update()
 
+    def set_scale_bar_spec(self, spec=None):
+        """Use an export-style scale bar overlay, or the ordinary auto bar."""
+        self._custom_scale_bar = spec
+        self.update()
+
+    def set_empty_message(self, text: str):
+        self._empty_message = str(text)
+        if not self._pixmap:
+            self.update()
+
     def set_detail(self, pixmap, rect_full):
         self._detail_pixmap = pixmap
         self._detail_rect_full = rect_full
@@ -260,8 +278,8 @@ class ImageCanvas(QWidget):
             p.setPen(QColor(120, 125, 132))
             p.setFont(QFont("Menlo", 13))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                       "Open an experiment folder, then click a well\n\n"
-                       "scroll = zoom   ·   drag = pan   ·   ⌘0 = fit")
+                       self._empty_message +
+                       "\n\nスクロール＝ズーム · ドラッグ＝移動 · ⌘0＝全体")
             p.end()
             return
         if self._pixmap:
@@ -295,6 +313,9 @@ class ImageCanvas(QWidget):
         umpp_screen = self.um_per_screen_px
         if umpp_screen <= 0:
             return
+        if self._custom_scale_bar is not None:
+            self._draw_custom_scale_bar(p, umpp_screen)
+            return
         max_bar = min(240, self.width() * 0.3)
         length_um, length_px, label = render.nice_scale_bar(umpp_screen, max_bar)
         if length_px <= 0:
@@ -315,6 +336,60 @@ class ImageCanvas(QWidget):
         p.setFont(QFont("Menlo", 11, QFont.Weight.Bold))
         p.drawText(QRect(int(x0 - 8), int(y - 24), int(length_px + 16), 18),
                    Qt.AlignmentFlag.AlignCenter, label)
+
+    def _draw_custom_scale_bar(self, painter: QPainter, umpp_screen: float):
+        spec = self._custom_scale_bar
+        if not spec.visible:
+            return
+        il, it, ir, ib = self._image_screen_rect()
+        max_width = max(1.0, min(300.0, (ir - il) * 0.28))
+        if spec.length_um is None:
+            length_um, length_px, auto_label = render.nice_scale_bar(
+                umpp_screen, max_width)
+        else:
+            length_um = float(spec.length_um)
+            length_px = length_um / umpp_screen
+            auto_label = (f"{length_um / 1000:g} mm" if length_um >= 1000
+                          else f"{length_um:g} µm")
+        if length_px <= 0:
+            return
+        length_px = min(length_px, max(1.0, ir - il - 16.0))
+        label = spec.label or auto_label
+        margin = max(5, min(70, int(spec.margin_px)))
+        thick = max(1, min(20, int(spec.thickness_px)))
+        font_size = max(8, min(24, int(round(spec.font_size_px * 0.7))))
+        font = QFont("Sans Serif")
+        font.setPixelSize(font_size)
+        font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        label_h = metrics.height() if spec.show_label else 0
+        gap = max(3, thick // 2)
+        total_h = thick + (gap + label_h if spec.show_label else 0)
+        right = "right" in spec.position
+        bottom = "bottom" in spec.position
+        x = ir - margin - length_px if right else il + margin
+        y = ib - margin - total_h if bottom else it + margin
+        text_w = metrics.horizontalAdvance(label) if spec.show_label else 0
+        panel_w = max(length_px, text_w)
+        pad = max(4, thick)
+        if spec.background in {"dark", "light"}:
+            background = QColor(0, 0, 0, 170) if spec.background == "dark" \
+                else QColor(255, 255, 255, 205)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(background)
+            painter.drawRoundedRect(
+                QRect(int(x - pad), int(y - pad), int(panel_w + 2 * pad),
+                      int(total_h + 2 * pad)), pad // 2, pad // 2)
+        color = QColor(*spec.color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawRect(QRect(int(x), int(y), int(length_px), thick))
+        if spec.show_label:
+            painter.setPen(color)
+            painter.drawText(
+                QRect(int(x), int(y + thick + gap), int(max(panel_w, 1)), label_h),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
 
     # --- interaction ---
     def _apply_zoom(self, factor, center: QPointF):
@@ -422,7 +497,7 @@ class ImageCanvas(QWidget):
 
 class DetailWorker(QThread):
     """Loads a full-res region composite for the current viewport."""
-    ready = pyqtSignal(object, object, int)  # QPixmap, (x0,y0,w,h), generation
+    ready = pyqtSignal(object, object, int)  # QImage, (x0,y0,w,h), generation
 
     def __init__(self, channel_paths, channel_views, full_dims, rect_full, detail_ds, gen):
         super().__init__()
@@ -460,7 +535,9 @@ class DetailWorker(QThread):
             arr = np.ascontiguousarray(rgb)
             h, w, _ = arr.shape
             qimg = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
-            self.ready.emit(QPixmap.fromImage(qimg), (x0, y0, x1 - x0, y1 - y0), self.gen)
+            # QImage is a reentrant value object and may cross a queued signal;
+            # QPixmap is a GUI resource and must be created on the main thread.
+            self.ready.emit(qimg, (x0, y0, x1 - x0, y1 - y0), self.gen)
         except Exception as e:
             print(f"Detail load error: {e}")
             self.ready.emit(None, None, self.gen)
@@ -898,9 +975,17 @@ class MainWindow(QMainWindow):
         self._gen = 0                 # bumped on every well load; stale worker results discarded
         self._detail_pending = False  # a viewport changed while a detail worker was running
         self._loading_experiment = False
-        self._mode = None             # None | "ktf" | "raw"
+        self._mode = None             # None | "ktf" | "raw" | "mosaic"
         self._raw_experiment = None   # raw model, kept separate from _experiment
         self._current_raw_well = None
+        self._mosaic_dataset = None
+        self._mosaic_geometry = None
+        self._mosaic_images = {}
+        self._mosaic_preview_ds = 1
+        self._mosaic_metadata_worker = None
+        self._mosaic_build_worker = None
+        self._mosaic_export_worker = None
+        self._mosaic_detail_worker = None
         self._scan_worker = None
         self._pending_root = None     # committed to settings only after a good load
         self._exporting = False       # a synchronous export is running
@@ -932,6 +1017,7 @@ class MainWindow(QMainWindow):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         tree_group = QGroupBox("Experiments")
+        self.tree_group = tree_group
         tg = QVBoxLayout(tree_group)
         self.folder_tree = QTreeWidget()
         self.folder_tree.setHeaderLabels(["Name", "Wells", "Channels"])
@@ -940,6 +1026,7 @@ class MainWindow(QMainWindow):
         tg.addWidget(self.folder_tree)
         ll.addWidget(tree_group)
         well_group = QGroupBox("Well Plate")
+        self.well_group = well_group
         wg = QVBoxLayout(well_group)
         well_tabs = QTabWidget()
         self.well_tabs = well_tabs
@@ -1011,7 +1098,18 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximumHeight(6)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.hide()
-        rl.addWidget(self.progress_bar)
+        progress_host = QWidget()
+        progress_layout = QHBoxLayout(progress_host)
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setSpacing(6)
+        progress_layout.addWidget(self.progress_bar, 1)
+        self.btn_cancel_operation = QPushButton("処理を中止")
+        self.btn_cancel_operation.setMaximumWidth(110)
+        self.btn_cancel_operation.setToolTip("現在の長い処理を安全な区切りで中止します")
+        self.btn_cancel_operation.clicked.connect(self._cancel_active_operation)
+        self.btn_cancel_operation.hide()
+        progress_layout.addWidget(self.btn_cancel_operation)
+        rl.addWidget(progress_host)
 
         bottom = QWidget()
         bl = QHBoxLayout(bottom)
@@ -1041,13 +1139,13 @@ class MainWindow(QMainWindow):
         export_group.setObjectName("quickExportGroup")
         eg = QVBoxLayout(export_group)
         eg.setSpacing(4)
-        b1 = QPushButton("Export PNG (view)…")
+        b1 = QPushButton("表示画像をPNG保存…")
         b1.clicked.connect(lambda: self._export("png"))
-        b2 = QPushButton("Export TIFF (full res)…")
+        b2 = QPushButton("現在のウェルをTIFF保存…")
         b2.clicked.connect(lambda: self._export("tiff"))
-        b3 = QPushButton("Export All Wells (TIFF)…")
+        b3 = QPushButton("全ウェルをTIFF一括保存…")
         b3.clicked.connect(self._export_all_wells)
-        self.btn_series_pdf = QPushButton("Stack / time series PDF…")
+        self.btn_series_pdf = QPushButton("Stack / time seriesを1つのPDFへ…")
         self.btn_series_pdf.setObjectName("primaryExportButton")
         self.btn_series_pdf.setToolTip(
             "別々に撮影したStack・time pointを選び、1つのプレートPDFにまとめます")
@@ -1077,29 +1175,37 @@ class MainWindow(QMainWindow):
                       "出力は OME-TIFF（Fiji / QuPath / napari で開けます）と PNG。")
         hint.setWordWrap(True); hint.setStyleSheet("color:#6b7280; font-size:11px;")
         rp.addWidget(hint)
-        self.btn_stitch_raw = QPushButton("Stitch Raw Tiles…")
+        self.btn_stitch_raw = QPushButton("プレートを貼り合わせて書き出す…")
         self.btn_stitch_raw.clicked.connect(self._stitch_raw_tiles)
         rp.addWidget(self.btn_stitch_raw)
         rp.addStretch()
         self.raw_panel.setMaximumHeight(200)
         self.raw_panel.setVisible(False)
         rl.addWidget(self.raw_panel, stretch=0)
+
+        self.mosaic_workspace = MosaicWorkspace()
+        self.mosaic_workspace.build_requested.connect(self._build_mosaic)
+        self.mosaic_workspace.export_requested.connect(self._export_mosaic)
+        self.mosaic_workspace.views_changed.connect(self._rebuild_mosaic_preview)
+        self.mosaic_workspace.scale_bar_changed.connect(self.canvas.set_scale_bar_spec)
+        self.mosaic_workspace.setVisible(False)
+        rl.addWidget(self.mosaic_workspace, stretch=0)
         splitter.addWidget(right)
         splitter.setSizes([380, 1120])
-        self.statusBar().showMessage("Open an experiment folder to begin")
+        self.statusBar().showMessage("画像セットを開いて開始します")
 
     def _setup_menu(self):
         menu = self.menuBar()
         fm = menu.addMenu("File")
-        a = QAction("Choose Workflow…", self)
-        a.setStatusTip("Switch between .ktf viewing and raw-tile stitching")
+        a = QAction("ワークフローを選ぶ…", self)
+        a.setStatusTip("通常画像・プレート画像・.ktfの入口を切り替えます")
         a.triggered.connect(self._show_start_chooser); fm.addAction(a)
         self.act_workflow = a
-        a = QAction("Open Folder...", self); a.setShortcut(QKeySequence("Ctrl+O"))
-        a.setStatusTip("Open a folder for the current workflow")
+        a = QAction("画像セットを開く…", self); a.setShortcut(QKeySequence("Ctrl+O"))
+        a.setStatusTip("現在のワークフローに合うフォルダを開きます")
         a.triggered.connect(self._open_folder); fm.addAction(a)
         self.act_open = a
-        a = QAction("Stack / time series PDF…", self)
+        a = QAction("Stack / time seriesを1つのPDFへ…", self)
         a.setStatusTip("複数撮影を選び、1つのプレートPDFにまとめます")
         a.triggered.connect(self._export_plate_pdf); fm.addAction(a)
         self.act_series_pdf = a
@@ -1134,8 +1240,8 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
         for label, tip, slot in [
-            ("Open", "Open experiment folder (⌘O)", self._open_folder),
-            ("Fit", "Fit image in view (⌘0)", self.canvas.fit_in_view),
+            ("開く", "画像セットを開く (⌘O)", self._open_folder),
+            ("全体", "画像全体を表示 (⌘0)", self.canvas.fit_in_view),
             ("100%", "Actual pixels (⌘1)", self.canvas.zoom_actual_pixels),
             ("Auto B/C", "Auto brightness/contrast (⇧⌘A)", self._auto_contrast_all),
         ]:
@@ -1224,7 +1330,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
-            "BZ-X 画像のウェルプレートビューア／タイル貼り合わせ<br>"
+            "広範囲モザイク／プレート画像／.ktf ビューア<br>"
             "&copy; 2026 yoshi-koba-lab — All Rights Reserved.<br><br>"
             "<a href='https://github.com/yoshi-koba-lab/bz-plate-studio'>"
             "github.com/yoshi-koba-lab/bz-plate-studio</a>")
@@ -1280,7 +1386,9 @@ class MainWindow(QMainWindow):
         s = QSettings()
         if mode == StartModeDialog.KTF:
             return s.value("last_ktf_root", "") or s.value("last_root", "") or ""
-        return s.value("last_raw_root", "") or ""
+        if mode == StartModeDialog.RAW:
+            return s.value("last_raw_root", "") or ""
+        return s.value("last_mosaic_root", "") or ""
 
     def _last_export_dir(self) -> str:
         """Where the previous export went, so Save-As opens somewhere useful."""
@@ -1294,22 +1402,26 @@ class MainWindow(QMainWindow):
         if self._busy:
             self.statusBar().showMessage("処理中です — 完了までお待ちください。")
             return
-        dlg = StartModeDialog(self, self._recent(StartModeDialog.KTF),
-                              self._recent(StartModeDialog.RAW))
-        dlg.setStyleSheet("")
+        dlg = StartModeDialog(
+            self, last_mosaic=self._recent(StartModeDialog.MOSAIC),
+            last_raw=self._recent(StartModeDialog.RAW),
+            last_ktf=self._recent(StartModeDialog.KTF))
         if dlg.exec() and dlg.choice:
             self._choose_folder(dlg.choice)
         elif self._mode is None:
             self.statusBar().showMessage(
-                "File ▸ Choose Workflow… から開始してください")
+                "File ▸ ワークフローを選ぶ… から開始してください")
 
     def _choose_folder(self, mode):
         start = self._recent(mode) or str(Path.home())
         if not Path(start).is_dir():
             start = str(Path.home())
-        title = ("Open a .ktf experiment folder (or any folder containing them)"
-                 if mode == StartModeDialog.KTF else
-                 "Open a raw-tile experiment folder (or any folder containing them)")
+        if mode == StartModeDialog.MOSAIC:
+            title = "通常画像セット（.gciを含む撮影フォルダ、またはその親）を選択"
+        elif mode == StartModeDialog.RAW:
+            title = "プレート画像セット（未貼り合わせタイル、またはその親）を選択"
+        else:
+            title = ".ktf画像セット（撮影フォルダ、またはその親）を選択"
         f = QFileDialog.getExistingDirectory(self, title, start)
         if not f:
             return
@@ -1358,6 +1470,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"スキャン中: {folder} …")
         self.progress_bar.setRange(0, 0)          # indeterminate
         self.progress_bar.show()
+        self._show_cancel_operation(True)
         self._set_actions_enabled(False)
         if self._plate_series_builder is not None:
             self._plate_series_builder.setEnabled(False)
@@ -1376,10 +1489,16 @@ class MainWindow(QMainWindow):
         self._save_conditions()
         self._experiment = None
         self._raw_experiment = None
+        self._mosaic_dataset = None
+        self._mosaic_geometry = None
+        self._mosaic_images.clear()
+        self._mosaic_preview_ds = 1
         self._current_raw_well = None
         self._reset_well_state()
         self.well_plate.set_wells({})
         self.conditions.set_wells([], {})
+        if hasattr(self, "mosaic_workspace"):
+            self.mosaic_workspace.clear()
         if self._plate_series_builder is not None:
             self._plate_series_builder.clear_active_path()
         self._update_raw_summary()
@@ -1387,6 +1506,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_done(self, dirs, errors):
         self.progress_bar.hide()
+        self._show_cancel_operation(False)
         self.progress_bar.setRange(0, 1000)
         self._set_actions_enabled(True)
         if self._plate_series_builder is not None:
@@ -1395,42 +1515,43 @@ class MainWindow(QMainWindow):
         if dirs is None:                      # cancelled
             self.statusBar().showMessage("スキャンを中止しました。")
             return
-        label = ".ktf" if mode == StartModeDialog.KTF else "生画像"
+        label = ({StartModeDialog.KTF: ".ktf",
+                  StartModeDialog.RAW: "プレート生画像",
+                  StartModeDialog.MOSAIC: "通常画像セット"}.get(mode, "画像"))
         if not dirs:
-            if mode == StartModeDialog.RAW and _looks_like_xy_scan(folder):
-                self.statusBar().showMessage(
-                    f"“{folder.name}” は XY スキャン形式のため対応していません")
-                QMessageBox.information(
-                    self, "この撮影形式には対応していません",
-                    f"“{folder}” は組織切片などの <b>XY スキャン</b>形式に見えます"
-                    "（<code>XY01/</code> の下にタイルが連番で並ぶ形式）。<br><br>"
-                    "本ソフトが扱うのは<b>ウェルプレート撮影</b>で、ウェルごとの"
-                    "フォルダの下が <code>X###Y###</code>（視野位置）に分かれている"
-                    "ものです。")
-                return
             self.statusBar().showMessage(
                 f"“{folder.name}” の下に {label} の実験が見つかりませんでした"
                 + (f"（{errors} 件のフォルダを読めませんでした）" if errors else ""))
             QMessageBox.information(
                 self, "実験が見つかりません",
                 f"“{folder}” の下に{label}形式の実験はありませんでした。\n\n"
-                "別のフォルダを選ぶか、File ▸ Choose Workflow… で"
-                "もう一方のワークフローをお試しください。")
+                "別のフォルダを選ぶか、File ▸ ワークフローを選ぶ… で"
+                "別のワークフローをお試しください。")
             return
         paths = {_path_key(path) for path in dirs}
-        active = self._experiment if mode == StartModeDialog.KTF else self._raw_experiment
-        other_loaded = (
-            self._raw_experiment is not None if mode == StartModeDialog.KTF
-            else self._experiment is not None)
+        if mode == StartModeDialog.KTF:
+            active = self._experiment
+        elif mode == StartModeDialog.RAW:
+            active = self._raw_experiment
+        else:
+            active = self._mosaic_dataset
+        active_path = (active["path"] if isinstance(active, dict)
+                       else getattr(active, "root", None))
+        other_loaded = any(model is not None for model in (
+            self._experiment if mode != StartModeDialog.KTF else None,
+            self._raw_experiment if mode != StartModeDialog.RAW else None,
+            self._mosaic_dataset if mode != StartModeDialog.MOSAIC else None))
         if (self._mode is not None and self._mode != mode) or other_loaded or (
-                active is not None and _path_key(active["path"]) not in paths):
+                active_path is not None and _path_key(active_path) not in paths):
             self._clear_loaded_experiment()
         self._set_mode(mode)
         self.folder_tree.clear()
         if mode == StartModeDialog.KTF:
             self._populate_tree(folder, dirs)
-        else:
+        elif mode == StartModeDialog.RAW:
             self._populate_raw_tree(folder, dirs)
+        else:
+            self._populate_mosaic_tree(folder, dirs)
         if len(dirs) == 1:
             self._select_tree_item(dirs[0])
             self._on_experiment_selected(self.folder_tree.currentItem(), 0)
@@ -1438,8 +1559,25 @@ class MainWindow(QMainWindow):
     def _set_mode(self, mode):
         self._mode = mode
         raw = mode == StartModeDialog.RAW
-        self.folder_tree.setHeaderLabels(
-            ["Name", "Wells", "Source"] if raw else ["Name", "Wells", "Channels"])
+        wide = mode == StartModeDialog.MOSAIC
+        if wide:
+            self.folder_tree.setHeaderLabels(["Name", "Grid", "Source"])
+            # The minimum 1200 px window gives this pane roughly 350 px.  Keep
+            # all three fields visible instead of opening with a horizontal
+            # scrollbar and a clipped Source column.
+            self.folder_tree.setColumnWidth(0, 155)
+            self.folder_tree.setColumnWidth(1, 60)
+            self.folder_tree.setColumnWidth(2, 105)
+        elif raw:
+            self.folder_tree.setHeaderLabels(["Name", "Wells", "Source"])
+            self.folder_tree.setColumnWidth(0, 200)
+            self.folder_tree.setColumnWidth(1, 100)
+            self.folder_tree.setColumnWidth(2, 100)
+        else:
+            self.folder_tree.setHeaderLabels(["Name", "Wells", "Channels"])
+            self.folder_tree.setColumnWidth(0, 200)
+            self.folder_tree.setColumnWidth(1, 100)
+            self.folder_tree.setColumnWidth(2, 100)
         # Conditions apply to both workflows; they are keyed by experiment path, and
         # the table is repopulated per experiment so values can never leak across.
         if hasattr(self, "well_tabs") and self.well_tabs.indexOf(self.cond_tab) < 0:
@@ -1447,20 +1585,69 @@ class MainWindow(QMainWindow):
         if hasattr(self, "raw_panel"):
             self.raw_panel.setVisible(raw)
         if hasattr(self, "ktf_bottom"):
-            self.ktf_bottom.setVisible(not raw)
-        if raw and self._plate_series_dock is not None:
+            self.ktf_bottom.setVisible(not raw and not wide)
+        if hasattr(self, "mosaic_workspace"):
+            self.mosaic_workspace.setVisible(wide)
+        self.canvas.set_scale_bar_spec(
+            self.mosaic_workspace.scale_bar if wide else None)
+        if hasattr(self, "well_group"):
+            self.well_group.setVisible(not wide)
+        if hasattr(self, "tree_group"):
+            self.tree_group.setTitle("画像セット" if wide else "Experiments")
+        if (raw or wide) and self._plate_series_dock is not None:
             self._plate_series_dock.hide()
         self._update_series_export_state()
-        self.setWindowTitle(f"{APP_NAME} {__version__} — "
-                            + ("生画像（スティッチング）" if raw else ".ktf 表示"))
+        title = ("通常画像セット（広範囲モザイク）" if wide else
+                 "プレート画像セット" if raw else ".ktf 表示")
+        self.canvas.set_empty_message(
+            "画像セットをダブルクリックし、「モザイクを作成」を押してください"
+            if wide else
+            "プレート画像セットをダブルクリックし、ウェルを選択してください"
+            if raw else
+            ".ktf画像セットをダブルクリックし、ウェルを選択してください")
+        self.setWindowTitle(f"{APP_NAME} {__version__} — {title}")
 
     def _commit_root(self):
         """Remember the browse root only once something actually loaded."""
         if not self._pending_root:
             return
         folder, mode = self._pending_root
-        key = "last_ktf_root" if mode == StartModeDialog.KTF else "last_raw_root"
+        key = ({StartModeDialog.KTF: "last_ktf_root",
+                StartModeDialog.RAW: "last_raw_root",
+                StartModeDialog.MOSAIC: "last_mosaic_root"}[mode])
         QSettings().setValue(key, str(folder))
+
+    def _populate_mosaic_tree(self, root: Path, exp_dirs: list):
+        """List GCI-described image sets without opening hundreds of TIFFs."""
+        groups = {}
+        for directory in exp_dirs:
+            try:
+                relative = directory.relative_to(root)
+            except ValueError:
+                relative = Path(directory.name)
+            group = relative.parts[0] if len(relative.parts) > 1 else ""
+            label = (str(Path(*relative.parts[1:])) if len(relative.parts) > 1
+                     else (relative.parts[0] if relative.parts else directory.name))
+            if not group and re.fullmatch(r"XY\d+", label, re.IGNORECASE):
+                label = f"{directory.parent.name} / {label}"
+            groups.setdefault(group, []).append((label, directory))
+        for group in sorted(groups, key=_natural_key):
+            container = self.folder_tree
+            if group:
+                parent = QTreeWidgetItem(self.folder_tree)
+                parent.setText(0, group)
+                container = parent
+            for label, directory in sorted(groups[group], key=lambda pair: _natural_key(pair[0])):
+                item = QTreeWidgetItem(container)
+                item.setText(0, label)
+                item.setText(1, "—")
+                item.setText(2, ".gci + OME-TIFF")
+                item.setToolTip(0, str(directory))
+                item.setData(0, Qt.ItemDataRole.UserRole, str(directory))
+                item.setData(0, Qt.ItemDataRole.UserRole + 1, StartModeDialog.MOSAIC)
+        self.folder_tree.expandAll()
+        self.statusBar().showMessage(
+            f"“{root.name}” に通常画像セットが {len(exp_dirs)} 件 — ダブルクリックで開きます")
 
     def _populate_raw_tree(self, root: Path, exp_dirs: list):
         groups = {}
@@ -1504,7 +1691,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"“{folder.name}”: タイル名は見つかりましたが、読めるタイル画像がありません")
             return False
-        self._experiment = None            # the two models never coexist
+        self._experiment = None            # workflow models never coexist
         self._reset_well_state()
         self._raw_experiment = {"name": folder.name, "path": folder, "wells": wells}
         self._current_raw_well = None
@@ -1513,7 +1700,7 @@ class MainWindow(QMainWindow):
         self.conditions.set_wells(sorted(wells), saved)
         unusable = structural - set(wells)
         msg = (f"{folder.name}: {len(wells)} ウェル（生画像）— "
-               f"ウェルを選ぶか、そのまま Stitch Raw Tiles… で全ウェルを処理できます")
+               f"ウェルを選ぶか、そのまま貼り合わせボタンで全ウェルを処理できます")
         if unusable:
             msg += f" / 使用不可: {', '.join(sorted(unusable))}"
         self.statusBar().showMessage(msg)
@@ -1521,6 +1708,86 @@ class MainWindow(QMainWindow):
         self._update_series_export_state()
         self._commit_root()
         return True
+
+    def _load_mosaic_experiment(self, folder: Path):
+        """Load metadata for one wide-area scan; registration starts explicitly."""
+        if self._busy:
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
+            return False
+        self._mosaic_metadata_worker = MosaicMetadataWorker(folder, self)
+        self._mosaic_metadata_worker.progress.connect(self._on_mosaic_progress)
+        self._mosaic_metadata_worker.ready.connect(self._on_mosaic_metadata_ready)
+        self._mosaic_metadata_worker.failed.connect(self._on_mosaic_failed)
+        self._mosaic_metadata_worker.finished.connect(self._on_mosaic_worker_finished)
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self._show_cancel_operation(True)
+        self._set_actions_enabled(False)
+        self.mosaic_workspace.setEnabled(False)
+        self.statusBar().showMessage(f"{folder.name}: GCI/OMEメタデータを検証中…")
+        self._mosaic_metadata_worker.start()
+        return True
+
+    def _on_mosaic_progress(self, message: str, value: float):
+        self.statusBar().showMessage(message)
+        self.progress_bar.setValue(int(max(0.0, min(1.0, value)) * 1000))
+
+    def _on_mosaic_metadata_ready(self, dataset):
+        self._save_conditions()
+        self._experiment = None
+        self._raw_experiment = None
+        self._mosaic_dataset = dataset
+        self._mosaic_geometry = None
+        self._mosaic_images.clear()
+        self._mosaic_preview_ds = 1
+        self._reset_well_state()
+        self.mosaic_workspace.set_dataset(dataset)
+        rows, cols = dataset.grid_shape
+        py, px = dataset.pixel_size_um_yx
+        physical = (f"{px:g} × {py:g} µm/px" if px is not None and py is not None
+                    else "未取得")
+        self.meta_text.setText("\n".join((
+            f"Image set: {dataset.name}",
+            f"Grid:      {rows} × {cols} ({len(dataset.tiles)} fields)",
+            f"Tile:      {dataset.tile_shape[1]} × {dataset.tile_shape[0]} px",
+            f"Channels:  {len(dataset.channels)}",
+            f"Pixel:     {physical}",
+            f"Source:    {dataset.gci_path}",
+            f"Warnings:  {len(dataset.warnings)}",
+        )))
+        self._select_tree_item(dataset.root)
+        current = self.folder_tree.currentItem()
+        if current is not None:
+            current.setText(1, f"{rows}×{cols}")
+            current.setText(2, f"{len(dataset.channels)} ch")
+        self._commit_root()
+        self.statusBar().showMessage(
+            f"{dataset.name}: {len(dataset.tiles)}視野を確認しました — 「モザイクを作成」を押してください")
+
+    def _on_mosaic_failed(self, message: str):
+        self.statusBar().showMessage(f"通常画像セットを開けませんでした: {message}")
+        QMessageBox.critical(
+            self, "通常画像セットを開けません",
+            f"GCIと元のOME-TIFFを確認できませんでした。\n\n{message}")
+
+    def _on_mosaic_worker_finished(self):
+        self.progress_bar.hide()
+        self._show_cancel_operation(False)
+        self._set_actions_enabled(True)
+        self.mosaic_workspace.setEnabled(True)
+        sender = self.sender()
+        if sender is self._mosaic_metadata_worker:
+            self._mosaic_metadata_worker = None
+        elif sender is self._mosaic_build_worker:
+            self._mosaic_build_worker = None
+        elif sender is self._mosaic_export_worker:
+            self._mosaic_export_worker = None
+        # These workers are parented to MainWindow so dropping the Python
+        # attribute alone does not release their dataset/geometry references.
+        # Dispose each finished QThread through Qt's event loop.
+        if sender is not None:
+            sender.deleteLater()
 
     def _on_raw_well_selected(self, well_id: str):
         self._current_raw_well = well_id
@@ -1546,7 +1813,7 @@ class MainWindow(QMainWindow):
     def _dispatch_well_clicked(self, well_id: str):
         if self._mode == StartModeDialog.RAW:
             self._on_raw_well_selected(well_id)
-        else:
+        elif self._mode == StartModeDialog.KTF:
             self._on_well_clicked(well_id)
 
     def _select_tree_item(self, path: Path):
@@ -1626,6 +1893,8 @@ class MainWindow(QMainWindow):
         mode = item.data(0, Qt.ItemDataRole.UserRole + 1) or StartModeDialog.KTF
         if mode == StartModeDialog.RAW:
             self._load_raw_experiment(Path(path))
+        elif mode == StartModeDialog.MOSAIC:
+            self._load_mosaic_experiment(Path(path))
         else:
             self._load_experiment(Path(path))
 
@@ -1666,7 +1935,7 @@ class MainWindow(QMainWindow):
         if skipped:
             msg += f" — skipped {len(skipped)} unreadable file(s): " + \
                    ", ".join(n for n, _ in skipped[:3]) + ("…" if len(skipped) > 3 else "")
-        self._raw_experiment = None       # the two models never coexist
+        self._raw_experiment = None       # workflow models never coexist
         self._commit_root()
         self.statusBar().showMessage(msg)
         self._update_series_export_state()
@@ -1916,6 +2185,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_detail(self):
         """Load a sharper composite for the current viewport when zoomed in."""
+        if self._mode == StartModeDialog.MOSAIC:
+            self._refresh_mosaic_detail()
+            return
         if not self._channel_images or self._full_dims == (0, 0):
             return
         mag = self.canvas.screen_px_per_full_px  # screen px per full-res px
@@ -1950,16 +2222,59 @@ class MainWindow(QMainWindow):
         self._detail_worker.finished.connect(self._on_detail_finished)
         self._detail_worker.start()
 
-    def _on_detail_ready(self, pixmap, rect_full, gen):
-        if gen != self._gen or pixmap is None:
+    def _on_detail_ready(self, image, rect_full, gen):
+        if gen != self._gen or image is None:
             return  # stale or failed; keep the scaled overview
-        self.canvas.set_detail(pixmap, rect_full)
+        self.canvas.set_detail(QPixmap.fromImage(image), rect_full)
 
     def _on_detail_finished(self):
         # If the viewport moved while this worker ran, render the latest view now.
         if self._detail_pending:
             self._detail_pending = False
             self._refresh_detail()
+
+    def _refresh_mosaic_detail(self):
+        if not self._mosaic_dataset or not self._mosaic_geometry or not self._mosaic_images:
+            return
+        magnification = self.canvas.screen_px_per_full_px
+        if magnification * self._mosaic_preview_ds <= 1.05:
+            self.canvas.set_detail(None, None)
+            self._detail_pending = False
+            return
+        if self._mosaic_detail_worker is not None and self._mosaic_detail_worker.isRunning():
+            self._detail_pending = True
+            return
+        x0, y0, x1, y1 = self.canvas.visible_full_rect()
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return
+        detail_ds = max(1, round(1.0 / max(magnification, 1e-6)))
+        while ((x1 - x0) // detail_ds) * ((y1 - y0) // detail_ds) > 7_000_000:
+            detail_ds += 1
+        self._detail_pending = False
+        self._mosaic_detail_worker = MosaicDetailWorker(
+            self._mosaic_dataset, self._mosaic_geometry,
+            self.mosaic_workspace.channel_views(),
+            str(self.mosaic_workspace.blend.currentData()),
+            (x0, y0, x1, y1), detail_ds, self._gen, self)
+        self._mosaic_detail_worker.ready.connect(self._on_mosaic_detail_ready)
+        self._mosaic_detail_worker.finished.connect(self._on_mosaic_detail_finished)
+        self._mosaic_detail_worker.start()
+
+    def _on_mosaic_detail_ready(self, image, rect_full, generation):
+        if generation != self._gen or image is None or self._mode != StartModeDialog.MOSAIC:
+            return
+        self.canvas.set_detail(numpy_to_qpixmap(image), rect_full)
+
+    def _on_mosaic_detail_finished(self):
+        worker = self.sender()
+        is_current = worker is self._mosaic_detail_worker
+        if is_current:
+            self._mosaic_detail_worker = None
+        if is_current and self._detail_pending:
+            self._detail_pending = False
+            self._refresh_mosaic_detail()
+        if worker is not None:
+            worker.deleteLater()
 
     # ---------- readout ----------
     def _on_cursor(self, fx, fy):
@@ -1970,6 +2285,18 @@ class MainWindow(QMainWindow):
             self.readout.setText("")
             return
         parts = [f"px ({int(fx)}, {int(fy)})"]
+        if self._mode == StartModeDialog.MOSAIC:
+            if self._um_per_px_full > 0:
+                parts.append(
+                    f"距離 ({fx * self._um_per_px_full / 1000:.3f}, "
+                    f"{fy * self._um_per_px_full / 1000:.3f}) mm")
+            ds = self._mosaic_preview_ds
+            for key, image in self._mosaic_images.items():
+                oy, ox = int(fy / ds), int(fx / ds)
+                if 0 <= oy < image.shape[0] and 0 <= ox < image.shape[1]:
+                    parts.append(f"{key}={image[oy, ox]}")
+            self.readout.setText("   ".join(parts))
+            return
         # absolute stage position in µm, if calibration + region known
         info0 = next(iter(self._channel_info.values()), None)
         if info0 and self._um_per_px_full > 0:
@@ -2005,6 +2332,12 @@ class MainWindow(QMainWindow):
         self.meta_text.setText("\n".join(l for l in lines if l))
 
     def _auto_contrast_all(self):
+        if self._mode == StartModeDialog.MOSAIC:
+            for key, row in self.mosaic_workspace.rows.items():
+                if key in self._mosaic_images:
+                    row.set_auto_levels(self._mosaic_images[key])
+            self._rebuild_mosaic_preview()
+            return
         for ch_id, ctrl in self._channel_controls.items():
             if ch_id in self._channel_images:
                 ctrl.auto_contrast(self._channel_images[ch_id])
@@ -2012,6 +2345,177 @@ class MainWindow(QMainWindow):
         self._refresh_detail()
         if self._plate_series_dock is not None and self._plate_series_dock.isVisible():
             self._plate_series_builder.set_channel_summary(self._pdf_channel_summary())
+
+    # ---------- wide-area mosaic ----------
+    def _build_mosaic(self, reference_channel: str, blend_mode: str):
+        if self._busy:
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
+            return
+        if not self._mosaic_dataset:
+            self.statusBar().showMessage("通常画像セットを開いてください。")
+            return
+        self._mosaic_build_worker = MosaicBuildWorker(
+            self._mosaic_dataset, reference_channel or None, blend_mode,
+            preview_side=4096, parent=self)
+        self._mosaic_build_worker.progress.connect(self._on_mosaic_progress)
+        self._mosaic_build_worker.ready.connect(self._on_mosaic_ready)
+        self._mosaic_build_worker.failed.connect(self._on_mosaic_build_failed)
+        self._mosaic_build_worker.cancelled.connect(
+            lambda: self.statusBar().showMessage("モザイク作成を中止しました。"))
+        self._mosaic_build_worker.finished.connect(self._on_mosaic_worker_finished)
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self._show_cancel_operation(True)
+        self._set_actions_enabled(False)
+        self.mosaic_workspace.setEnabled(False)
+        self.statusBar().showMessage("Stage座標と画像の継ぎ目から位置を推定中…")
+        self._mosaic_build_worker.start()
+
+    def _on_mosaic_build_failed(self, message: str):
+        self.statusBar().showMessage(f"モザイクを作成できませんでした: {message}")
+        QMessageBox.critical(
+            self, "モザイクを作成できません",
+            f"位置合わせまたは画像読込中に問題が発生しました。\n\n{message}")
+
+    def _on_mosaic_ready(self, geometry, images, downsample: int):
+        self._mosaic_geometry = geometry
+        self._mosaic_images = dict(images)
+        self._mosaic_preview_ds = max(1, int(downsample))
+        self.mosaic_workspace.set_geometry(geometry, images)
+        self._rebuild_mosaic_preview(reset_view=True)
+        self._show_mosaic_metadata()
+        self.statusBar().showMessage(
+            f"モザイク完成: {geometry.output_shape[1]:,} × {geometry.output_shape[0]:,} px · "
+            f"継ぎ目 {geometry.accepted_edges}/{geometry.expected_edges} を画像で確認")
+
+    def _rebuild_mosaic_preview(self, reset_view=False):
+        if self._mode != StartModeDialog.MOSAIC or not self._mosaic_images:
+            return
+        rgb = render.composite(
+            self.mosaic_workspace.channel_views(), self._mosaic_images)
+        pixmap = numpy_to_qpixmap(rgb)
+        self.canvas.set_detail(None, None)
+        geometry = self._mosaic_geometry
+        pixel_x = self._mosaic_dataset.pixel_size_um_yx[1]
+        if geometry is None or pixel_x is None:
+            return
+        full_h, full_w = geometry.output_shape
+        self._full_dims = (full_w, full_h)
+        self._overview_ds = self._mosaic_preview_ds
+        self._um_per_px_full = float(pixel_x)
+        self.canvas.update_geometry(self._overview_ds, full_w, full_h, float(pixel_x))
+        if reset_view or self.canvas._pixmap is None:
+            self.canvas.set_overview(
+                pixmap, self._overview_ds, full_w, full_h, float(pixel_x))
+        else:
+            self.canvas.update_overview_pixmap(pixmap)
+            self._refresh_mosaic_detail()
+
+    def _show_mosaic_metadata(self):
+        dataset, geometry = self._mosaic_dataset, self._mosaic_geometry
+        if not dataset or not geometry:
+            return
+        py, px = dataset.pixel_size_um_yx
+        fov_x = geometry.output_shape[1] * float(px) / 1000.0
+        fov_y = geometry.output_shape[0] * float(py) / 1000.0
+        residual = (f"{geometry.residual_p95:.3f} px"
+                    if geometry.residual_p95 is not None else "N/A")
+        self.meta_text.setText("\n".join((
+            f"Image set:  {dataset.name}",
+            f"Grid:       {dataset.grid_shape[0]} × {dataset.grid_shape[1]}",
+            f"Fields:     {len(dataset.tiles)}",
+            f"Channels:   {', '.join(c.label for c in dataset.channels)}",
+            f"Mosaic:     {geometry.output_shape[1]:,} × {geometry.output_shape[0]:,} px",
+            f"Physical:   {fov_x:.2f} × {fov_y:.2f} mm",
+            f"Pixel:      {px:g} × {py:g} µm/px",
+            f"Reference:  {geometry.reference_channel}",
+            f"Edges:      {geometry.accepted_edges}/{geometry.expected_edges}",
+            f"Residual:   p95 {residual}",
+            f"GCI:        {dataset.gci_path}",
+        )))
+
+    def _export_mosaic(self, kind: str):
+        if self._busy:
+            self.statusBar().showMessage("処理中です — 完了までお待ちください。")
+            return
+        if not self._mosaic_dataset or not self._mosaic_geometry:
+            self.statusBar().showMessage("先にモザイクを作成してください。")
+            return
+        extensions = {"ome": ".ome.tif", "png": ".png", "tiff": ".tif", "pdf": ".pdf"}
+        filters = {
+            "ome": "OME-TIFF (*.ome.tif *.ome.tiff)", "png": "PNG (*.png)",
+            "tiff": "TIFF (*.tif *.tiff)", "pdf": "PDF (*.pdf)",
+        }
+        base = _safe_base_name(self._mosaic_dataset.name) or "mosaic"
+        suffix = extensions[kind]
+        default = str(Path(self._last_export_dir()) / f"{base}{suffix}")
+
+        def derived(path):
+            if kind != "ome":
+                return [path]
+            return [path, Path(str(path) + ".mosaic-qc.json"),
+                    path.with_name(path.stem + "_alignment.csv")]
+
+        path = _ask_save_path(
+            self, "モザイクを書き出す", default, filters[kind], derived=derived)
+        if path is None:
+            return
+        problem = _writable_problem(path.parent)
+        if problem:
+            QMessageBox.critical(self, "この場所には保存できません", problem)
+            return
+        self._remember_export_dir(path.parent)
+        self._mosaic_export_worker = MosaicExportWorker(
+            self._mosaic_dataset, self._mosaic_geometry, path, kind,
+            self.mosaic_workspace.channel_views(),
+            str(self.mosaic_workspace.blend.currentData()),
+            self.mosaic_workspace.scale_bar,
+            self.mosaic_workspace.presentation_max_side,
+            self.mosaic_workspace.presentation_dpi, self)
+        self._mosaic_export_worker.progress.connect(self._on_mosaic_progress)
+        self._mosaic_export_worker.done.connect(self._on_mosaic_export_done)
+        self._mosaic_export_worker.failed.connect(self._on_mosaic_export_failed)
+        self._mosaic_export_worker.cancelled.connect(
+            lambda: self.statusBar().showMessage("書き出しを中止しました。"))
+        self._mosaic_export_worker.finished.connect(self._on_mosaic_worker_finished)
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self._show_cancel_operation(True)
+        self._set_actions_enabled(False)
+        self.mosaic_workspace.setEnabled(False)
+        self.statusBar().showMessage("モザイクを書き出し中…")
+        self._mosaic_export_worker.start()
+
+    def _on_mosaic_export_done(self, path: str):
+        self.statusBar().showMessage(f"保存しました: {path}")
+
+    def _on_mosaic_export_failed(self, message: str):
+        self.statusBar().showMessage(f"書き出しに失敗しました: {message}")
+        QMessageBox.critical(
+            self, "モザイクを書き出せません", _friendly_error(Exception(message)))
+
+    def _show_cancel_operation(self, visible: bool):
+        button = getattr(self, "btn_cancel_operation", None)
+        if button is None:
+            return
+        button.setText("処理を中止")
+        button.setEnabled(bool(visible))
+        button.setVisible(bool(visible))
+
+    def _cancel_active_operation(self):
+        candidates = (
+            self._mosaic_export_worker, self._mosaic_build_worker,
+            self._mosaic_metadata_worker, self._scan_worker, self._stitch_worker)
+        worker = next((item for item in candidates
+                       if item is not None and item.isRunning()), None)
+        if worker is None or not hasattr(worker, "cancel"):
+            return
+        worker.cancel()
+        self.btn_cancel_operation.setText("中止中…")
+        self.btn_cancel_operation.setEnabled(False)
+        self.statusBar().showMessage("安全な区切りで処理を中止しています…")
 
     # ---------- export ----------
     def _export(self, fmt):
@@ -2109,7 +2613,10 @@ class MainWindow(QMainWindow):
     def _busy(self) -> bool:
         """True while any long operation owns the data (export or stitch)."""
         return self._loading_experiment or self._exporting or (
-            self._stitch_worker is not None and self._stitch_worker.isRunning())
+            self._stitch_worker is not None and self._stitch_worker.isRunning()) or any(
+                worker is not None and worker.isRunning() for worker in (
+                    self._scan_worker, self._mosaic_metadata_worker,
+                    self._mosaic_build_worker, self._mosaic_export_worker))
 
     def closeEvent(self, event):
         """Don't let a half-written mosaic be left behind on quit."""
@@ -2121,6 +2628,12 @@ class MainWindow(QMainWindow):
                 "PDFまたは画像の書き出しが完了するまでお待ちください。")
             event.ignore()
             return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.cancel()
+            self._scan_worker.wait(15000)
+            if self._scan_worker.isRunning():
+                event.ignore()
+                return
         if self._stitch_worker is not None and self._stitch_worker.isRunning():
             ans = QMessageBox.question(
                 self, "Stitching in progress",
@@ -2132,6 +2645,50 @@ class MainWindow(QMainWindow):
                 return
             self._stitch_worker.cancel()
             self._stitch_worker.wait(15000)
+            if self._stitch_worker.isRunning():
+                QMessageBox.information(
+                    self, "終了を待っています",
+                    "現在のタイル処理が安全に停止するまで、もう少しお待ちください。")
+                event.ignore()
+                return
+        mosaic_workers = [worker for worker in (
+            self._mosaic_metadata_worker, self._mosaic_build_worker,
+            self._mosaic_export_worker) if worker is not None and worker.isRunning()]
+        if mosaic_workers:
+            ans = QMessageBox.question(
+                self, "モザイク処理中です",
+                "通常画像セットの処理が続いています。中止して終了しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            for worker in mosaic_workers:
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+                worker.wait(15000)
+            if any(worker.isRunning() for worker in mosaic_workers):
+                QMessageBox.information(
+                    self, "終了を待っています",
+                    "安全に停止するまで、もう少しお待ちください。")
+                event.ignore()
+                return
+        if self._mosaic_detail_worker is not None and self._mosaic_detail_worker.isRunning():
+            self._mosaic_detail_worker.wait(15000)
+            if self._mosaic_detail_worker.isRunning():
+                event.ignore()
+                return
+        passive_workers = [worker for worker in (
+            *self._workers, self._detail_worker, self._update_checker)
+            if worker is not None and worker.isRunning()]
+        for worker in passive_workers:
+            worker.wait(15000)
+        if any(worker.isRunning() for worker in passive_workers):
+            QMessageBox.information(
+                self, "読込の終了を待っています",
+                "画像または更新情報の読込が完了してから、もう一度終了してください。")
+            event.ignore()
+            return
         event.accept()
 
     # ---------- stitching raw tiles ----------
@@ -2142,7 +2699,7 @@ class MainWindow(QMainWindow):
             return
         if not self._raw_experiment or not self._raw_experiment.get("wells"):
             self.statusBar().showMessage(
-                "生画像の実験を開いてください（File ▸ Choose Workflow… ▸ 生画像から始める）")
+                "プレート画像セットを開いてください（File ▸ ワークフローを選ぶ…）")
             return
         wells = self._raw_experiment["wells"]
 
@@ -2178,6 +2735,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
+        self._show_cancel_operation(True)
         cond = self.conditions.to_dict()
         headers = cond.get("__headers__") or list(WellConditionsTable.DEFAULT_HEADERS)
         self._stitch_worker = StitchWorker(
@@ -2197,6 +2755,7 @@ class MainWindow(QMainWindow):
 
     def _on_stitch_done(self, ok, failed, out_dir):
         self.progress_bar.hide()
+        self._show_cancel_operation(False)
         self._set_actions_enabled(True)
         if hasattr(self, "btn_stitch_raw"):
             self.btn_stitch_raw.setEnabled(True)
@@ -2923,36 +3482,43 @@ class UpdateChecker(QThread):
 
 
 class StartModeDialog(QDialog):
-    """Which of the two workflows to start in.
+    """Choose one of the three explicit acquisition workflows.
 
-    The two paths need different discovery: a `.ktf` experiment has the mosaics
-    already, a raw capture folder has only per-field tiles. Inferring the mode
-    from a folder was the old behaviour and it silently hid raw folders, so the
-    choice is explicit.
+    The folder shapes overlap enough that guessing can silently choose the wrong
+    reader.  The first card is the wide tissue/ordinary XY workflow; plate raw
+    tiles and already-stitched KTF files remain separate and unchanged.
     """
 
-    KTF, RAW = "ktf", "raw"
+    MOSAIC, RAW, KTF = "mosaic", "raw", "ktf"
 
-    def __init__(self, parent=None, last_ktf="", last_raw=""):
+    def __init__(self, parent=None, last_ktf="", last_raw="", last_mosaic=""):
         super().__init__(parent)
-        self.setWindowTitle("KTF Viewer — start")
-        self.setMinimumWidth(560)
+        self.setWindowTitle(f"{APP_NAME} — start")
+        self.setMinimumWidth(650)
         self.choice = None
         lay = QVBoxLayout(self)
-        lay.setSpacing(10)
+        lay.setContentsMargins(18, 16, 18, 14)
+        lay.setSpacing(12)
 
-        head = QLabel("<b>どちらから始めますか？</b>")
+        head = QLabel("<span style='font-size:18px'><b>何を読み込みますか？</b></span>")
         lay.addWidget(head)
+        intro = QLabel("撮影形式に合う入口を選ぶと、必要な操作だけを表示します。")
+        intro.setStyleSheet("color:#64748b;")
+        lay.addWidget(intro)
 
-        for mode, title, desc, last, btn_text in [
-            (self.KTF, ".ktf から始める（貼り合わせ済み）",
-             "顕微鏡が出力した .ktf のモザイクを開いて表示・書き出します。", last_ktf,
-             ".ktf フォルダを選ぶ…"),
-            (self.RAW, "生画像から始める（未貼り合わせ）",
-             "各視野の X###Y### タイルを読み込み、貼り合わせ（スティッチング）します。",
-             last_raw, "生画像フォルダを選ぶ…"),
+        for number, mode, title, desc, last, btn_text in [
+            (1, self.MOSAIC, "通常画像セットを読み込む",
+             "組織切片などの広範囲XY撮影を、Stage座標と画像の重なりから高精度に貼り合わせます。",
+             last_mosaic, "通常画像セットを選ぶ…"),
+            (2, self.RAW, "プレート画像セットを読み込む",
+             "ウェルごとの X###Y### 生画像タイルを読み込み、プレート単位で貼り合わせます。",
+             last_raw, "プレート画像セットを選ぶ…"),
+            (3, self.KTF, ".ktfファイルを読み込む",
+             "貼り合わせ済みの .ktf をプレート表示し、チャンネル調整・書き出しを行います。",
+             last_ktf, ".ktf画像セットを選ぶ…"),
         ]:
-            box = QGroupBox(title)
+            box = QGroupBox(f"{number}  {title}")
+            box.setObjectName("primaryWorkflowCard" if mode == self.MOSAIC else "workflowCard")
             v = QVBoxLayout(box)
             d = QLabel(desc)
             d.setWordWrap(True)
@@ -2964,13 +3530,33 @@ class StartModeDialog(QDialog):
                 p.setWordWrap(True)
                 v.addWidget(p)
             b = QPushButton(btn_text)
+            if mode == self.MOSAIC:
+                b.setObjectName("primaryExportButton")
             b.clicked.connect(lambda _, m=mode: self._pick(m))
             v.addWidget(b)
             lay.addWidget(box)
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+        self.setStyleSheet("""
+            QDialog { background:#f3f6fa; color:#1f2937; }
+            QGroupBox#workflowCard, QGroupBox#primaryWorkflowCard {
+                background:#ffffff; border:1px solid #d5dce6; border-radius:10px;
+                margin-top:12px; padding:14px 12px 10px 12px; font-weight:600;
+            }
+            QGroupBox#primaryWorkflowCard { border:2px solid #4b8fda; }
+            QGroupBox#workflowCard::title, QGroupBox#primaryWorkflowCard::title {
+                subcontrol-origin:margin; left:14px; padding:0 5px;
+            }
+            QPushButton { min-height:30px; background:#ffffff; color:#1f2937;
+                border:1px solid #b9c4d2; border-radius:7px; padding:2px 12px; }
+            QPushButton:hover { background:#edf5ff; border-color:#4b8fda; }
+            QPushButton#primaryExportButton { background:#1674c5; color:#ffffff;
+                border-color:#1265ac; font-weight:700; }
+            QPushButton#primaryExportButton:hover { background:#0f67b4; }
+        """)
 
     def _pick(self, mode):
         self.choice = mode
@@ -3007,10 +3593,14 @@ class ScanWorker(QThread):
                     if any(ktf_reader.is_ktf_file(Path(f)) for f in filenames):
                         found.append(d)
                         dirnames[:] = []
-                else:
+                elif self.mode == StartModeDialog.RAW:
                     if _is_raw_experiment(d, dirnames):
                         found.append(d)
                         dirnames[:] = []      # its wells/fields are not experiments
+                else:
+                    if _is_mosaic_experiment(d, filenames):
+                        found.append(d)
+                        dirnames[:] = []      # GCI owns the XY child sources
         except Exception:
             errors += 1
         self.finished_scan.emit(sorted(found), errors)
@@ -3126,14 +3716,28 @@ def _ask_save_path(parent, title, default_name, filt, derived=None):
       * the TIFF export writes `<name>_<channel>.tif` — files Qt never sees.
     `derived(path)` returns the real list of files for the chosen name.
     """
-    want = Path(default_name).suffix
+    # A filter can advertise a compound extension (``*.ome.tif``) and more than
+    # one legal spelling.  Looking only at ``Path.suffix`` turned ``foo`` into
+    # ``foo.tif`` and even turned a valid ``foo.ome.tiff`` into
+    # ``foo.ome.tiff.tif``.  Prefer the longest advertised suffix already used by
+    # the default name, and accept every suffix shown in the active filter.
+    accepted = []
+    for suffix in re.findall(r"\*([.][A-Za-z0-9.]+)", filt or ""):
+        suffix = suffix.lower()
+        if suffix not in accepted:
+            accepted.append(suffix)
+    accepted.sort(key=len, reverse=True)
+    default_lower = Path(default_name).name.lower()
+    want = next((suffix for suffix in accepted if default_lower.endswith(suffix)),
+                Path(default_name).suffix)
     start = default_name
     while True:
         chosen, _ = QFileDialog.getSaveFileName(parent, title, start, filt)
         if not chosen:
             return None
         path = Path(chosen)
-        if want and path.suffix.lower() != want.lower():
+        name_lower = path.name.lower()
+        if want and not any(name_lower.endswith(suffix) for suffix in accepted or [want.lower()]):
             path = path.with_name(path.name + want)
         targets = list(derived(path)) if derived else [path]
         # Qt already confirmed the one name the user typed; only ask about the rest.
@@ -3932,13 +4536,17 @@ def _writable_problem(folder: Path) -> str:
         if not os.access(folder, os.W_OK):
             return (f"“{folder}” に書き込む権限がありません。\n"
                     "別の場所を選ぶか、フォルダの権限をご確認ください。")
-        probe = folder / ".ktfviewer_write_test"
-        try:
-            probe.touch()
-            probe.unlink()
-        except OSError as e:
-            return (f"“{folder}” に書き込めませんでした（{e.strerror or e}）。\n"
+        # Never probe with ``touch`` + ``unlink`` on a fixed name: if a user
+        # already had that file, the check itself deleted it.  QSaveFile stages a
+        # unique neighbour and cancelWriting() removes only that private staging
+        # file without ever committing the nominal target.
+        probe = QSaveFile(str(folder / ".bz-studio-write-test"))
+        probe.setDirectWriteFallback(False)
+        if not probe.open(QIODevice.OpenModeFlag.WriteOnly):
+            detail = probe.errorString() or "unknown write error"
+            return (f"“{folder}” に書き込めませんでした（{detail}）。\n"
                     "別の場所を選び直してください。")
+        probe.cancelWriting()
     except Exception as e:
         return f"“{folder}” を確認できませんでした: {e}"
     return ""
@@ -3992,6 +4600,16 @@ def _raw_wells_of(folder: Path) -> list:
 
 def _is_raw_experiment(folder: Path, dirnames=None) -> bool:
     return bool(_raw_wells_of(folder))
+
+
+def _is_mosaic_experiment(folder: Path, filenames=None) -> bool:
+    """A discovery candidate has exactly one GCI directly inside it."""
+    try:
+        names = (list(filenames) if filenames is not None
+                 else [entry.name for entry in folder.iterdir()])
+    except OSError:
+        return False
+    return sum(str(name).lower().endswith(".gci") for name in names) == 1
 
 
 #: sequentially-numbered tile, e.g. IPF1_XY01_00457_CHF.bz.ome.tif
@@ -4483,12 +5101,81 @@ def _install_excepthook():
         print(text, file=sys.stderr)
         try:
             QMessageBox.critical(
-                None, "KTF Viewer — unexpected error",
+                None, f"{APP_NAME} — unexpected error",
                 f"{exc_type.__name__}: {exc}\n\nThe app will keep running.")
         except Exception:
             pass
 
     sys.excepthook = hook
+
+
+def _run_package_smoke(output_dir: Path) -> int:
+    """Exercise lazy binary codecs inside a frozen app, then exit.
+
+    PyInstaller cannot discover imagecodecs' importlib-based codec loading from
+    static analysis.  CI launches the finished bundle with the private
+    ``BZ_STUDIO_PACKAGE_SMOKE`` environment variable so a build that cannot
+    decode LZW or write compressed OME-TIFF never reaches a public release.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "package-smoke.json"
+    report = {"ok": False, "app": APP_NAME, "version": __version__}
+    try:
+        import imagecodecs
+        import tifffile
+
+        source = ((np.arange(64, dtype=np.uint16)[:, None] * 31
+                   + np.arange(80, dtype=np.uint16)[None, :] * 17) % 4093)
+        lzw_path = output_dir / "codec-lzw.tif"
+        tifffile.imwrite(
+            lzw_path, source, compression="lzw", predictor=True,
+            photometric="minisblack")
+        np.testing.assert_array_equal(tifffile.imread(lzw_path), source)
+
+        ome_path = output_dir / "codec-zlib.ome.tif"
+        channels = np.stack((source, np.flip(source, axis=1)))
+        tifffile.imwrite(
+            ome_path, channels, bigtiff=True, ome=True, compression="zlib",
+            predictor=True, photometric="minisblack",
+            metadata={"axes": "CYX", "Channel": {"Name": ["A", "B"]}})
+        with tifffile.TiffFile(ome_path) as check:
+            if not check.ome_metadata or not check.series:
+                raise RuntimeError("OME metadata validation failed")
+            np.testing.assert_array_equal(check.series[0].asarray(), channels)
+
+        # Exercise the real atomic presentation path as well as scientific
+        # TIFF codecs.  In particular this catches Windows builds where fsync
+        # is attempted on a read-only descriptor.
+        presentation_array = np.stack((
+            (source % 256).astype(np.uint8),
+            (np.flip(source, axis=1) % 256).astype(np.uint8),
+            (np.flip(source, axis=0) % 256).astype(np.uint8),
+        ), axis=2)
+        presentation = Image.fromarray(presentation_array)
+        png_path = output_dir / "presentation.png"
+        pdf_path = output_dir / "presentation.pdf"
+        mosaic_engine.atomic_save_presentation(presentation, png_path, "png")
+        mosaic_engine.atomic_save_presentation(presentation, pdf_path, "pdf")
+        with Image.open(png_path) as check:
+            np.testing.assert_array_equal(np.asarray(check), presentation_array)
+        pdf_data = pdf_path.read_bytes()
+        if not pdf_data.startswith(b"%PDF-") or b"%%EOF" not in pdf_data[-4096:]:
+            raise RuntimeError("presentation PDF validation failed")
+
+        # Touch the functions explicitly so the test proves the delayed modules
+        # themselves, rather than only tifffile's public wrapper, are bundled.
+        if not callable(imagecodecs.lzw_decode) or not callable(imagecodecs.zlib_encode):
+            raise RuntimeError("required imagecodecs functions are unavailable")
+        report.update({
+            "ok": True, "lzw": lzw_path.name, "ome": ome_path.name,
+            "png": png_path.name, "pdf": pdf_path.name,
+            "shape": list(channels.shape),
+        })
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0 if report["ok"] else 1
 
 
 def main():
@@ -4497,16 +5184,20 @@ def main():
     # Automated runs must never write into the real user settings — a test that
     # fills the Conditions table would otherwise persist against a real experiment.
     app.setApplicationName(
-        APP_NAME + " (test)" if os.environ.get("BZPS_TEST") else APP_NAME)
+        SETTINGS_APP_NAME + " (test)" if os.environ.get("BZPS_TEST") else SETTINGS_APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setStyle(LeftAffirmativeStyle())   # Yes/OK on the left
     _install_excepthook()
     window = MainWindow()
     window.show()
-    # Always ask which workflow to start in; the two paths need different discovery.
+    # Always ask which workflow to start in; the three paths need different discovery.
     QTimer.singleShot(0, window._show_start_chooser)
     sys.exit(app.exec())
 
 
 if __name__ == "__main__":
+    _smoke_dir = os.environ.get("BZ_STUDIO_PACKAGE_SMOKE")
+    if _smoke_dir:
+        raise SystemExit(_run_package_smoke(Path(_smoke_dir)))
     main()

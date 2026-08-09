@@ -52,17 +52,25 @@ def composite(channels: list, images: dict) -> np.ndarray:
         return np.zeros((*any_img.shape[:2], 3), dtype=np.uint8)
 
     h, w = images[visible[0].ch_id].shape[:2]
-    acc = np.zeros((h, w, 3), dtype=np.float32)
-
+    output = np.empty((h, w, 3), dtype=np.uint8)
     single_solo = len(visible) == 1 and visible[0].solo
-    for c in visible:
-        scaled = apply_levels(images[c.ch_id], c.lo, c.hi, c.gamma)
-        color = (255, 255, 255) if single_solo else c.color
-        acc[:, :, 0] += scaled * (color[0] / 255.0)
-        acc[:, :, 1] += scaled * (color[1] / 255.0)
-        acc[:, :, 2] += scaled * (color[2] / 255.0)
-
-    return np.clip(acc * 255.0, 0, 255).astype(np.uint8)
+    # A full 4k RGB float accumulator plus multiply/clip temporaries can exceed
+    # 700 MB.  Stripe composition is pixel-identical and bounds scratch memory
+    # to roughly 16 MB irrespective of mosaic height.
+    stripe_rows = max(1, min(h, 1_000_000 // max(1, w)))
+    for y0 in range(0, h, stripe_rows):
+        y1 = min(h, y0 + stripe_rows)
+        acc = np.zeros((y1 - y0, w, 3), dtype=np.float32)
+        for c in visible:
+            scaled = apply_levels(images[c.ch_id][y0:y1], c.lo, c.hi, c.gamma)
+            color = (255, 255, 255) if single_solo else c.color
+            acc[:, :, 0] += scaled * (color[0] / 255.0)
+            acc[:, :, 1] += scaled * (color[1] / 255.0)
+            acc[:, :, 2] += scaled * (color[2] / 255.0)
+        np.multiply(acc, 255.0, out=acc)
+        np.clip(acc, 0.0, 255.0, out=acc)
+        output[y0:y1] = acc.astype(np.uint8)
+    return output
 
 
 def nice_scale_bar(um_per_px: float, max_bar_px: float) -> tuple:

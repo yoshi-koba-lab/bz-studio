@@ -17,18 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-latest runners are Apple Silicon; a build made there will not run
-          # on Intel Macs, so build both. macos-13 was retired, so Intel builds use
-          # macos-15-intel.
-          - os: macos-latest
-            artifact: BZ-Plate-Studio-macOS-appleSilicon
-            bundle: "dist/BZ Plate Studio.app"
+          # Pin the Apple Silicon build to macOS 15 instead of macos-latest.
+          # Freezing on the oldest supported OS gives the PyInstaller bundle a
+          # predictable deployment target; macos-latest can move to a newer OS.
+          - os: macos-15
+            artifact: BZ-Studio-macOS-appleSilicon
+            bundle: "dist/BZ Studio.app"
           - os: macos-15-intel
-            artifact: BZ-Plate-Studio-macOS-intel
-            bundle: "dist/BZ Plate Studio.app"
+            artifact: BZ-Studio-macOS-intel
+            bundle: "dist/BZ Studio.app"
           - os: windows-latest
-            artifact: BZ-Plate-Studio-Windows
-            bundle: "dist/BZ Plate Studio"
+            artifact: BZ-Studio-Windows
+            bundle: "dist/BZ Studio"
     runs-on: ${{ matrix.os }}
     # A retired runner label queues forever instead of failing; cap it so a bad
     # label is visible in minutes rather than blocking the release.
@@ -45,18 +45,44 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          BZPS_TEST: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m unittest discover -s tests -v
+
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm ktf_viewer.spec
+
+      - name: Smoke-test packaged app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          smoke_dir="$RUNNER_TEMP/bz-studio-smoke"
+          BZ_STUDIO_PACKAGE_SMOKE="$smoke_dir" QT_QPA_PLATFORM=offscreen \
+            "dist/BZ Studio.app/Contents/MacOS/BZ Studio"
+          python -c "import json,sys; assert json.load(open(sys.argv[1], encoding='utf-8'))['ok']" \
+            "$smoke_dir/package-smoke.json"
+
+      - name: Smoke-test packaged app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $smokeDir = Join-Path $env:RUNNER_TEMP "bz-studio-smoke"
+          $env:BZ_STUDIO_PACKAGE_SMOKE = $smokeDir
+          & "dist/BZ Studio/BZ Studio.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Packaged codec smoke test failed" }
+          python -c "import json,sys; assert json.load(open(sys.argv[1], encoding='utf-8'))['ok']" (Join-Path $smokeDir "package-smoke.json")
 
       - name: Zip bundle (macOS)
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -ry "../${{ matrix.artifact }}.zip" "BZ Plate Studio.app"
+          zip -ry "../${{ matrix.artifact }}.zip" "BZ Studio.app"
 
       - name: Zip bundle (Windows)
         if: runner.os == 'Windows'
-        run: Compress-Archive -Path "dist/BZ Plate Studio/*" -DestinationPath "${{ matrix.artifact }}.zip"
+        run: Compress-Archive -Path "dist/BZ Studio/*" -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -64,8 +90,20 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
 
-      - name: Attach to Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/')
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Publish only after every platform has built and tested successfully, so
+      # a failed matrix leg can never create a partial public release.
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Attach all bundles to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact }}.zip
+          generate_release_notes: true
+          files: release-assets/*.zip
