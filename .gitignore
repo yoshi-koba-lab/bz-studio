@@ -29,18 +29,29 @@ scratchpad/
 synthetic/
 work/
 
-# Agent handoff notes — local only. HANDOFF.md in particular names real
-# experiment folders and drive paths; neither belongs on the public repo.
-AGENTS.md
-HANDOFF.md
+# Local agent and handoff notes. Their real files live outside the Git root in
+# ../Non-Sharable; these entries also protect the local convenience symlinks.
+/AGENTS.md
+/CLAUDE.md
+/HANDOFF.md
+/Non-Sharable/
+/review_*/
 
 # Exported results — the app's save dialogs default to the working directory, so
 # real experiment output easily lands here. Never publish it.
 *.ktf
+*.gci
+*.ici
+*.ibc2
+*.chf
+*.raw
 *.tif
 *.tiff
 *.pdf
 *.png
 *.jpg
+*.mosaic-qc.json
+*_alignment.csv
+*_stitch_qc.csv
 *_conditions.csv
 !docs/**/*.png
