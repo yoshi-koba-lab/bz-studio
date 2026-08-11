@@ -121,7 +121,7 @@ if sys.platform == "darwin":
         bundle_identifier="io.github.ktf-viewer",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "2.0.0",
-            "CFBundleVersion": "2.0.0",
+            "CFBundleShortVersionString": "2.0.1",
+            "CFBundleVersion": "2.0.1",
         },
     )
