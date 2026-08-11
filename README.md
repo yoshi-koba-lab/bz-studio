@@ -14,7 +14,6 @@
 1. [Releases](https://github.com/yoshi-koba-lab/bz-plate-studio/releases)からmacOSまたはWindows版を取得して起動します。
 2. 起動画面で「通常画像セット」「プレート画像セット」「`.ktf`」のいずれかを選び、撮影フォルダ（`.ktf`はファイル）を開きます。
 3. 通常画像セットでは位置合わせ方法を確認して **Stitching実行**、プレート画像では対象ウェル、`.ktf`ではプレート上のウェルを選びます。
-4. チャンネルの色・明るさ・ガンマ、Conditions、スケールバー、表示倍率を必要に応じて調整します。
-5. 書き出し形式と出力品質を選んで保存します。Stack / time series PDFは撮影フォルダを追加し、収録順を整えてから保存します。
+4. チャンネル、Conditions、スケールバー、表示倍率を調整し、形式と出力品質を選んで保存します。Stack / time series PDFは撮影フォルダを追加し、収録順を整えてから保存します。
 
 スクロール／ピンチでズーム、ドラッグで移動、`Ctrl/Cmd+0`で全体表示します。ライセンスは[LICENSE](LICENSE)、第三者ライセンスは[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)を参照してください。
