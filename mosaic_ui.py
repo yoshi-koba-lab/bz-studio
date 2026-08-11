@@ -291,7 +291,7 @@ class MosaicChannelRow(QWidget):
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(low, high)
         slider.setValue(value)
-        slider.setMinimumWidth(50)
+        slider.setMinimumWidth(42)
         slider.valueChanged.connect(self.changed.emit)
         return slider
 
