@@ -263,7 +263,7 @@ class MosaicChannelRow(QWidget):
 
         self.enabled = QCheckBox(channel.label)
         self.enabled.setChecked(bool(enabled))
-        self.enabled.setMinimumWidth(100)
+        self.enabled.setMinimumWidth(88)
         self.enabled.setToolTip(f"{channel.label}\n{channel.key}")
         layout.addWidget(self.enabled)
         self.color_button = QToolButton()
