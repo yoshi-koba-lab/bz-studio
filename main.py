@@ -2581,7 +2581,7 @@ class MainWindow(QMainWindow):
             str(self.mosaic_workspace.blend.currentData()),
             self.mosaic_workspace.scale_bar,
             self.mosaic_workspace.presentation_max_side,
-            self.mosaic_workspace.presentation_dpi, self)
+            self.mosaic_workspace.effective_presentation_dpi(), self)
         self._mosaic_export_worker.progress.connect(self._on_mosaic_progress)
         self._mosaic_export_worker.done.connect(self._on_mosaic_export_done)
         self._mosaic_export_worker.failed.connect(self._on_mosaic_export_failed)

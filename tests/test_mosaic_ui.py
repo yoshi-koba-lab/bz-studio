@@ -15,13 +15,16 @@ from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QThread
 from PySide6.QtGui import QCloseEvent, QImage, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QGroupBox, QLabel, QPushButton, QScrollArea,
+    QApplication, QGroupBox, QLabel, QPushButton, QScrollArea, QWidget,
 )
 
 import main
 import mosaic_engine
 import render
-from mosaic_ui import MosaicExportWorker, OutputQualityDialog, ScaleBarDialog
+from mosaic_ui import (
+    MosaicExportWorker, OutputQualityDialog, ScaleBarDialog,
+    recommended_presentation_dpi,
+)
 
 
 class _RunningWorker:
@@ -139,6 +142,7 @@ class MosaicUiTests(unittest.TestCase):
         self.assertEqual(window.mosaic_workspace.quality_button.text(), "出力品質…")
         self.assertEqual(window.mosaic_workspace.presentation_max_side, 0)
         self.assertIn("Maximum", window.mosaic_workspace.scale_summary.text())
+        self.assertIn("600dpi（自動）", window.mosaic_workspace.scale_summary.text())
         for control in (
                 window.mosaic_workspace.reference_label,
                 window.mosaic_workspace.reference,
@@ -218,13 +222,42 @@ class MosaicUiTests(unittest.TestCase):
         self.assertIsNone(corner.anchor_y)
 
     def test_output_quality_defaults_to_unlimited_maximum(self):
-        dialog = OutputQualityDialog(0, 300)
+        dialog = OutputQualityDialog(0, 300, native_long_side=16000)
         self.addCleanup(dialog.close)
         self.assertEqual(dialog.quality.currentText(), "Maximum（上限なし）")
-        self.assertEqual(dialog.values(), (0, 300))
+        self.assertFalse(dialog.dpi.isEnabled())
+        self.assertEqual(dialog.dpi.value(), 600)
+        self.assertEqual(dialog.values(), (0, 300, True))
         dialog.quality.setCurrentIndex(dialog.quality.findData(8000))
-        dialog.dpi.setValue(600)
-        self.assertEqual(dialog.values(), (8000, 600))
+        self.assertEqual(dialog.dpi.value(), 300)
+        self.assertEqual(dialog.values(), (8000, 300, True))
+        dialog.auto_dpi.setChecked(False)
+        dialog.dpi.setValue(425)
+        dialog.quality.setCurrentIndex(dialog.quality.findData(4000))
+        self.assertEqual(dialog.values(), (4000, 425, False))
+        dialog.auto_dpi.setChecked(True)
+        self.assertEqual(dialog.dpi.value(), 150)
+        self.assertEqual(dialog.values(), (4000, 425, True))
+        dialog.auto_dpi.setChecked(False)
+        self.assertEqual(dialog.dpi.value(), 425)
+
+    def test_recommended_dpi_tracks_actual_presentation_pixels(self):
+        self.assertEqual(recommended_presentation_dpi(4000), 150)
+        self.assertEqual(recommended_presentation_dpi(8000), 300)
+        self.assertEqual(recommended_presentation_dpi(12000), 450)
+        self.assertEqual(recommended_presentation_dpi(0, 16000), 600)
+        self.assertEqual(recommended_presentation_dpi(0, 8000), 300)
+        self.assertEqual(recommended_presentation_dpi(0, 50000), 1200)
+        # The renderer downsamples by integer factors; 15,594 px at the
+        # 12,000 px limit becomes 7,797 actual output pixels, hence 300 dpi.
+        self.assertEqual(recommended_presentation_dpi(12000, 15594), 300)
+
+    def test_output_quality_keeps_legacy_parent_argument(self):
+        parent = QWidget()
+        self.addCleanup(parent.close)
+        dialog = OutputQualityDialog(0, 300, parent)
+        self.addCleanup(dialog.close)
+        self.assertIs(dialog.parent(), parent)
 
     def test_about_discloses_pyside_and_lgpl(self):
         window = self._window()

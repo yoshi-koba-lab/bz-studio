@@ -8,6 +8,7 @@ file half way through.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,24 @@ DEFAULT_CHANNEL_COLORS = (
     (230, 230, 230),
     (177, 87, 255),
 )
+
+
+def recommended_presentation_dpi(max_side: int,
+                                 native_long_side: Optional[int] = None) -> int:
+    """Keep automatic exports near the print size of 8,000 px at 300 dpi."""
+    limit = int(max_side)
+    native = int(native_long_side) if native_long_side else 0
+    if native > 0:
+        if limit <= 0:
+            output_long_side = native
+        else:
+            downsample = max(1, int(math.ceil(native / max(512, limit))))
+            output_long_side = int(math.ceil(native / downsample))
+    else:
+        output_long_side = limit if limit > 0 else 16000
+    raw_dpi = output_long_side * 300.0 / 8000.0
+    rounded = int(math.floor(raw_dpi / 50.0 + 0.5) * 50)
+    return max(150, min(1200, rounded))
 
 
 class MosaicMetadataWorker(QThread):
@@ -429,8 +448,11 @@ class ScaleBarDialog(QDialog):
 class OutputQualityDialog(QDialog):
     """Presentation resolution and file-DPI editor."""
 
-    def __init__(self, max_side: int, dpi: int, parent=None):
+    def __init__(self, max_side: int, dpi: int, parent=None, *,
+                 dpi_auto: bool = True,
+                 native_long_side: Optional[int] = None):
         super().__init__(parent)
+        self.native_long_side = native_long_side
         self.setWindowTitle("出力品質")
         self.setMinimumWidth(430)
         layout = QVBoxLayout(self)
@@ -445,16 +467,28 @@ class OutputQualityDialog(QDialog):
         idx = self.quality.findData(int(max_side))
         self.quality.setCurrentIndex(idx if idx >= 0 else 0)
         form.addRow("PNG / TIFF / PDF", self.quality)
+        self.auto_dpi = QCheckBox("品質に合わせて自動設定")
+        self.auto_dpi.setChecked(bool(dpi_auto))
+        form.addRow("自動連動", self.auto_dpi)
         self.dpi = QSpinBox()
         self.dpi.setRange(72, 1200)
         self.dpi.setValue(dpi)
         self.dpi.setSuffix(" dpi")
-        form.addRow("PDF / TIFF解像度", self.dpi)
+        form.addRow("DPI（印刷サイズ）", self.dpi)
+        self._manual_dpi = int(dpi)
+        self.dpi.valueChanged.connect(self._remember_manual_dpi)
+        self.quality.currentIndexChanged.connect(self._quality_changed)
+        self.auto_dpi.toggled.connect(self._auto_toggled)
+        if self.auto_dpi.isChecked():
+            self._apply_recommended_dpi()
+        self.dpi.setEnabled(not self.auto_dpi.isChecked())
         layout.addLayout(form)
         note = QLabel(
             "MaximumはStitching結果を縮小せず、全ピクセルで書き出します。"
             "大規模データでは処理時間とメモリ使用量が増えます。\n"
-            "OME-TIFFはこの設定に関係なく、常に全解像度です。")
+            "DPIは画素数を変えず、PNG/TIFFの印刷密度とPDFのページ寸法を"
+            "指定します。自動は8,000 px＝300 dpiと同程度の印刷サイズを"
+            "目安にします。\nOME-TIFFはこの設定に関係なく、常に全解像度です。")
         note.setWordWrap(True)
         note.setStyleSheet("color:#64748b;font-size:11px;")
         layout.addWidget(note)
@@ -464,8 +498,29 @@ class OutputQualityDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _apply_recommended_dpi(self):
+        self.dpi.setValue(recommended_presentation_dpi(
+            int(self.quality.currentData()), self.native_long_side))
+
+    def _quality_changed(self, *_args):
+        if self.auto_dpi.isChecked():
+            self._apply_recommended_dpi()
+
+    def _auto_toggled(self, automatic: bool):
+        if automatic:
+            self._manual_dpi = self.dpi.value()
+            self._apply_recommended_dpi()
+        else:
+            self.dpi.setValue(self._manual_dpi)
+        self.dpi.setEnabled(not automatic)
+
+    def _remember_manual_dpi(self, value: int):
+        if not self.auto_dpi.isChecked():
+            self._manual_dpi = int(value)
+
     def values(self):
-        return int(self.quality.currentData()), self.dpi.value()
+        return (int(self.quality.currentData()), self._manual_dpi,
+                self.auto_dpi.isChecked())
 
 
 class MosaicWorkspace(QGroupBox):
@@ -483,7 +538,8 @@ class MosaicWorkspace(QGroupBox):
         self.rows: dict[str, MosaicChannelRow] = {}
         self.scale_bar = mosaic_engine.ScaleBarSpec()
         self.presentation_max_side = 0  # Maximum: no presentation downsampling
-        self.presentation_dpi = 300
+        self.presentation_dpi = 300  # last manual value; auto resolves separately
+        self.presentation_dpi_auto = True
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(9, 12, 9, 7)
@@ -645,6 +701,7 @@ class MosaicWorkspace(QGroupBox):
             + (f" メタデータ警告 {len(dataset.warnings)}件。" if dataset.warnings else ""))
         self.build_button.setEnabled(True)
         self.set_ready(False)
+        self._update_scale_summary()
 
     def set_geometry(self, geometry, images):
         self.geometry = geometry
@@ -661,6 +718,7 @@ class MosaicWorkspace(QGroupBox):
             f"{geometry.output_shape[0]:,} px"
             + ("<br>⚠ " + " ".join(geometry.warnings) if geometry.warnings else ""))
         self.set_ready(True)
+        self._update_scale_summary()
 
     def _settings_changed(self):
         if self.geometry is None:
@@ -692,11 +750,25 @@ class MosaicWorkspace(QGroupBox):
 
     def edit_output_quality(self):
         dialog = OutputQualityDialog(
-            self.presentation_max_side, self.presentation_dpi, self)
+            self.presentation_max_side, self.presentation_dpi,
+            self, dpi_auto=self.presentation_dpi_auto,
+            native_long_side=self._native_long_side())
         dialog.setStyleSheet("")
         if dialog.exec():
-            self.presentation_max_side, self.presentation_dpi = dialog.values()
+            (self.presentation_max_side, self.presentation_dpi,
+             self.presentation_dpi_auto) = dialog.values()
             self._update_scale_summary()
+
+    def _native_long_side(self) -> Optional[int]:
+        if self.geometry is None:
+            return None
+        return int(max(self.geometry.output_shape))
+
+    def effective_presentation_dpi(self) -> int:
+        if self.presentation_dpi_auto:
+            return recommended_presentation_dpi(
+                self.presentation_max_side, self._native_long_side())
+        return int(self.presentation_dpi)
 
     def set_scale_bar_position(self, anchor_x: float, anchor_y: float):
         """Store a preview drag as resolution-independent export coordinates."""
@@ -713,5 +785,6 @@ class MosaicWorkspace(QGroupBox):
                  if self.scale_bar.visible else "スケールバーなし")
         quality = ("Maximum" if self.presentation_max_side <= 0
                    else f"長辺 {self.presentation_max_side:,}px")
+        dpi_mode = "自動" if self.presentation_dpi_auto else "手動"
         self.scale_summary.setText(
-            f"{shown}\n出力 {quality} · {self.presentation_dpi}dpi")
+            f"{shown}\n出力 {quality} · {self.effective_presentation_dpi()}dpi（{dpi_mode}）")
