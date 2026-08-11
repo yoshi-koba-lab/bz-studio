@@ -259,11 +259,11 @@ class MosaicChannelRow(QWidget):
         self.maximum = int(np.iinfo(dtype).max) if np.issubdtype(dtype, np.integer) else 65535
         layout = QHBoxLayout(self)
         layout.setContentsMargins(2, 1, 2, 1)
-        layout.setSpacing(5)
+        layout.setSpacing(3)
 
         self.enabled = QCheckBox(channel.label)
         self.enabled.setChecked(bool(enabled))
-        self.enabled.setMinimumWidth(88)
+        self.enabled.setMinimumWidth(100)
         self.enabled.setToolTip(f"{channel.label}\n{channel.key}")
         layout.addWidget(self.enabled)
         self.color_button = QToolButton()
