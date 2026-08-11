@@ -257,32 +257,36 @@ class MosaicChannelRow(QWidget):
         self.color = tuple(channel.color or color)
         dtype = np.dtype(channel.dtype)
         self.maximum = int(np.iinfo(dtype).max) if np.issubdtype(dtype, np.integer) else 65535
-        layout = QHBoxLayout(self)
+        layout = QGridLayout(self)
         layout.setContentsMargins(2, 1, 2, 1)
-        layout.setSpacing(3)
+        layout.setHorizontalSpacing(5)
+        layout.setVerticalSpacing(2)
 
         self.enabled = QCheckBox(channel.label)
         self.enabled.setChecked(bool(enabled))
         self.enabled.setMinimumWidth(100)
         self.enabled.setToolTip(f"{channel.label}\n{channel.key}")
-        layout.addWidget(self.enabled)
+        layout.addWidget(self.enabled, 0, 0, 1, 4)
         self.color_button = QToolButton()
         self.color_button.setFixedSize(22, 22)
         self.color_button.clicked.connect(self._choose_color)
-        layout.addWidget(self.color_button)
+        layout.addWidget(self.color_button, 0, 4)
         self.solo = QToolButton()
         self.solo.setText("S")
         self.solo.setCheckable(True)
         self.solo.setFixedSize(22, 22)
         self.solo.setToolTip("このチャンネルだけをグレースケール表示")
-        layout.addWidget(self.solo)
+        layout.addWidget(self.solo, 0, 5)
 
         self.low = self._slider(0, self.maximum, 0)
         self.high = self._slider(1, self.maximum, self.maximum)
         self.gamma = self._slider(10, 300, 100)
-        for label, slider in (("min", self.low), ("max", self.high), ("γ", self.gamma)):
-            layout.addWidget(QLabel(label))
-            layout.addWidget(slider, 1)
+        for index, (label, slider) in enumerate(
+                (("min", self.low), ("max", self.high), ("γ", self.gamma))):
+            label_column = index * 2
+            layout.addWidget(QLabel(label), 1, label_column)
+            layout.addWidget(slider, 1, label_column + 1)
+            layout.setColumnStretch(label_column + 1, 1)
         self._update_color()
         self.enabled.toggled.connect(self.changed.emit)
         self.solo.toggled.connect(self.changed.emit)
@@ -291,7 +295,7 @@ class MosaicChannelRow(QWidget):
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(low, high)
         slider.setValue(value)
-        slider.setMinimumWidth(42)
+        slider.setMinimumWidth(50)
         slider.valueChanged.connect(self.changed.emit)
         return slider
 
