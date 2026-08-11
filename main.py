@@ -1441,8 +1441,8 @@ class MainWindow(QMainWindow):
             "Complete license texts, notices and replacement instructions are included "
             "in <code>THIRD_PARTY_NOTICES.md</code> and <code>licenses/</code>.<br>"
             "<a href='https://doc.qt.io/qtforpython-6/'>Qt for Python</a><br><br>"
-            "<a href='https://github.com/yoshi-koba-lab/bz-plate-studio'>"
-            "github.com/yoshi-koba-lab/bz-plate-studio</a>")
+            "<a href='https://github.com/yoshi-koba-lab/bz-studio'>"
+            "github.com/yoshi-koba-lab/bz-studio</a>")
 
     def _apply_style(self):
         self.setStyleSheet("""
@@ -3548,7 +3548,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(i + 1)
             yield page
 
-REPO = "yoshi-koba-lab/bz-plate-studio"
+REPO = "yoshi-koba-lab/bz-studio"
 
 
 def _newer(remote: str, local: str) -> bool:

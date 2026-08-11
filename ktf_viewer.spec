@@ -90,7 +90,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=os.environ.get("BZ_STUDIO_CONSOLE") == "1",
+    console=False,
     disable_windowed_traceback=False,
     # The app opens datasets through its own dialogs and does not consume
     # Finder-open command-line events.  PyInstaller's argv emulation starts an

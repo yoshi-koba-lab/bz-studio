@@ -84,19 +84,10 @@ jobs:
         run: |
           $smokeDir = Join-Path $env:RUNNER_TEMP "bz-studio-smoke"
           $env:BZ_STUDIO_PACKAGE_SMOKE = $smokeDir
-          & "dist/BZ Studio/BZ Studio.exe"
-          $initialExit = $LASTEXITCODE
+          $process = Start-Process -FilePath "dist/BZ Studio/BZ Studio.exe" -Wait -PassThru
           $report = Join-Path $smokeDir "package-smoke.json"
           if (Test-Path $report) { Get-Content $report }
-          if ($initialExit -ne 0 -and -not (Test-Path $report)) {
-            Write-Host "Windowed app failed before writing a report; rebuilding with a console for diagnostics."
-            Remove-Item build,dist -Recurse -Force
-            $env:BZ_STUDIO_CONSOLE = "1"
-            pyinstaller --noconfirm ktf_viewer.spec
-            & "dist/BZ Studio/BZ Studio.exe"
-            if (Test-Path $report) { Get-Content $report }
-          }
-          if ($initialExit -ne 0) { throw "Packaged codec smoke test failed" }
+          if ($process.ExitCode -ne 0) { throw "Packaged codec smoke test failed" }
           python -c "import json,sys; assert json.load(open(sys.argv[1], encoding='utf-8'))['ok']" $report
 
       - name: Zip bundle (macOS)

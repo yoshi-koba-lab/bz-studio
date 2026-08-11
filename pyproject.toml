@@ -29,8 +29,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yoshi-koba-lab/bz-plate-studio"
-Issues = "https://github.com/yoshi-koba-lab/bz-plate-studio/issues"
+Homepage = "https://github.com/yoshi-koba-lab/bz-studio"
+Issues = "https://github.com/yoshi-koba-lab/bz-studio/issues"
 
 [project.gui-scripts]
 bz-studio = "main:main"
