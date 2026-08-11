@@ -236,6 +236,10 @@ class ScaleBarSpec:
     visible: bool = True
     length_um: Optional[float] = None
     position: str = "bottom-left"
+    # Optional normalized top-left position inside the available image area.
+    # This keeps a position chosen by dragging stable across preview/export sizes.
+    anchor_x: Optional[float] = None
+    anchor_y: Optional[float] = None
     color: tuple[int, int, int] = (255, 255, 255)
     thickness_px: int = 8
     font_size_px: int = 32
@@ -1934,7 +1938,10 @@ def render_preview_channels(dataset, geometry: MosaicGeometry,
     """Render bounded channel mosaics for the interactive viewer."""
 
     channel_keys = channel_keys or [c.key for c in dataset.channels]
-    ds = max(1, int(math.ceil(max(geometry.output_shape) / max(512, max_side))))
+    # max_side <= 0 is the explicit Maximum setting: do not downsample.
+    ds = (1 if int(max_side) <= 0 else
+          max(1, int(math.ceil(
+              max(geometry.output_shape) / max(512, int(max_side))))))
     images = {}
     count = max(1, len(channel_keys))
     for ci, key in enumerate(channel_keys):
@@ -2029,14 +2036,25 @@ def draw_scale_bar(image: Image.Image, pixel_um: float,
         )
     if max(length_px, text_w) > available_w or total_h > available_h:
         raise ValueError("scale-bar label or height does not fit inside the image")
-    pos = spec.position.lower()
-    x = out.width - margin - length_px if "right" in pos else margin
-    y = out.height - margin - total_h if "bottom" in pos else margin
+    panel_w = max(length_px, text_w)
+    min_x = margin
+    max_x = max(min_x, out.width - margin - panel_w)
+    min_y = margin
+    max_y = max(min_y, out.height - margin - total_h)
+    if spec.anchor_x is not None and spec.anchor_y is not None:
+        anchor_x = float(np.clip(spec.anchor_x, 0.0, 1.0))
+        anchor_y = float(np.clip(spec.anchor_y, 0.0, 1.0))
+        x = int(round(min_x + anchor_x * (max_x - min_x)))
+        y = int(round(min_y + anchor_y * (max_y - min_y)))
+    else:
+        pos = spec.position.lower()
+        x = max_x if "right" in pos else min_x
+        y = max_y if "bottom" in pos else min_y
     pad = max(4, thick)
     if spec.background in {"dark", "light"}:
         bg = (0, 0, 0) if spec.background == "dark" else (255, 255, 255)
         probe.rounded_rectangle(
-            (x - pad, y - pad, x + max(length_px, text_w) + pad,
+            (x - pad, y - pad, x + panel_w + pad,
              y + total_h + pad), radius=max(3, pad // 2), fill=bg)
     color = tuple(int(np.clip(c, 0, 255)) for c in spec.color)
     probe.rectangle((x, y, x + length_px, y + thick - 1), fill=color)

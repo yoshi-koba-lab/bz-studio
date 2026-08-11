@@ -40,6 +40,29 @@ def _dataset(planes, origins, dtype="uint8", pixel_size=(0.8, 0.8)):
 
 
 class MosaicEngineTests(unittest.TestCase):
+    def test_maximum_preview_quality_means_no_downsampling(self):
+        geometry = SimpleNamespace(output_shape=(24000, 18000))
+        dataset = SimpleNamespace(channels=(SimpleNamespace(key="c"),))
+        downsample_values = []
+
+        class FakeRenderer:
+            def __init__(self, *_args, **kwargs):
+                downsample_values.append(kwargs["downsample"])
+                self.output_shape = (2, 3)
+                self.output_dtype = np.dtype("uint8")
+
+            def render_block(self, _y, _x, height, width):
+                return np.zeros((height, width), np.uint8)
+
+        with patch.object(engine, "ChunkRenderer", FakeRenderer):
+            images, downsample = engine.render_preview_channels(
+                dataset, geometry, ["c"], max_side=0,
+                radiometric_correction=False)
+
+        self.assertEqual(downsample, 1)
+        self.assertEqual(downsample_values, [1])
+        self.assertEqual(images["c"].shape, (2, 3))
+
     def test_striped_composite_matches_full_float_reference(self):
         rng = np.random.default_rng(3)
         images = {
@@ -569,6 +592,29 @@ class MosaicEngineTests(unittest.TestCase):
             engine.draw_scale_bar(
                 Image.new("RGB", (100, 50)), 1.0,
                 engine.ScaleBarSpec(length_um=200, margin_px=5))
+
+    def test_scale_bar_drag_anchor_is_resolution_independent(self):
+        spec = engine.ScaleBarSpec(
+            length_um=20, anchor_x=0.5, anchor_y=0.25,
+            color=(0, 0, 0), thickness_px=4, margin_px=10,
+            show_label=False, background="none")
+        small = np.asarray(engine.draw_scale_bar(
+            Image.new("RGB", (100, 60), "white"), 1.0, spec))
+        large = np.asarray(engine.draw_scale_bar(
+            Image.new("RGB", (200, 120), "white"), 1.0, spec))
+
+        # At each output size the normalized anchor selects the same relative
+        # point of the available top-left range, while physical length stays 20 px.
+        np.testing.assert_array_equal(small[19, 40:60], 0)
+        np.testing.assert_array_equal(large[34, 90:110], 0)
+
+    def test_scale_bar_export_prefers_arial(self):
+        loaded = object()
+        with patch.object(engine.ImageFont, "truetype", return_value=loaded) as load:
+            self.assertIs(engine._font(24), loaded)
+        self.assertEqual(
+            load.call_args.args[0],
+            "/System/Library/Fonts/Supplemental/Arial.ttf")
 
     def test_pyramid_tile_generator_honours_cancellation_per_tile(self):
         array = np.arange(64, dtype=np.uint8).reshape(1, 8, 8)

@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
 )
 from PySide6.QtCore import (
-    Qt, QSize, QSizeF, QMarginsF, Signal, QPoint, QRect, QThread, QTimer,
+    Qt, QSize, QSizeF, QMarginsF, Signal, QPoint, QRect, QRectF, QThread, QTimer,
     QPointF, QEvent, QSettings, QUrl, QSaveFile, QIODevice,
 )
 from PySide6.QtGui import (
@@ -78,6 +78,7 @@ CHANNEL_COLORS = {
 }
 
 MAX_DISPLAY_MEGAPIXELS = 16  # overview cap
+SCALE_BAR_FONT_FAMILY = "Arial"
 
 
 def _path_key(path) -> str:
@@ -118,6 +119,7 @@ class ImageCanvas(QWidget):
 
     view_changed = Signal()          # emitted after zoom/pan settles (debounced)
     cursor_moved = Signal(float, float)  # full-res image coords under cursor
+    scale_bar_position_changed = Signal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,7 +137,12 @@ class ImageCanvas(QWidget):
         self._zoom = 1.0
         self._pan = QPointF(0, 0)
         self._dragging = False
+        self._dragging_scale_bar = False
         self._drag_start = QPointF()
+        self._scale_drag_offset = QPointF()
+        self._scale_bar_hit_rect = QRectF()
+        self._scale_bar_drag_limits = None
+        self._scale_bar_hover = False
         self._fitted_once = False   # first fit is automatic; later resizes keep the user's zoom
         self._zoom_edit_busy = False  # clearFocus() re-fires editingFinished; guard re-entry
 
@@ -149,17 +156,35 @@ class ImageCanvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
 
-        # Editable zoom field, overlaid at the bottom-left corner.
-        self.zoom_edit = QLineEdit(self)
+        # Clearly labelled editable zoom field, overlaid at the bottom-left corner.
+        self.zoom_control = QWidget(self)
+        self.zoom_control.setObjectName("zoomControl")
+        self.zoom_control.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        zoom_layout = QHBoxLayout(self.zoom_control)
+        zoom_layout.setContentsMargins(7, 3, 5, 3)
+        zoom_layout.setSpacing(4)
+        zoom_label = QLabel("倍率", self.zoom_control)
+        zoom_label.setObjectName("zoomLabel")
+        zoom_layout.addWidget(zoom_label)
+        self.zoom_edit = QLineEdit(self.zoom_control)
         self.zoom_edit.setFixedWidth(66)
         self.zoom_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.zoom_edit.setToolTip("Zoom % — type a value and press Enter")
-        self.zoom_edit.setStyleSheet(
-            "QLineEdit { background: rgba(255,255,255,225); color:#1c1e21;"
-            " border:1px solid #b6bcc4; border-radius:4px; padding:1px;"
-            " font-family:Menlo; font-size:11px; }")
+        self.zoom_edit.setAccessibleName("表示倍率（数値入力）")
+        self.zoom_edit.setToolTip("倍率を数値で入力（例: 150 または 150%）し、Enterキーで適用")
+        zoom_layout.addWidget(self.zoom_edit)
+        self.zoom_control.setFixedSize(116, 32)
+        self.zoom_control.setStyleSheet("""
+            QWidget#zoomControl {
+                background:rgba(255,255,255,235); color:#1c1e21;
+                border:1px solid #8aa9cf; border-radius:6px;
+            }
+            QLabel#zoomLabel { border:none; color:#34465c; font-size:11px; }
+            QLineEdit { background:#ffffff; color:#1c1e21;
+                border:1px solid #4b8fda; border-radius:4px; padding:1px 3px;
+                font-family:Menlo; font-size:11px; selection-background-color:#1674c5; }
+        """)
         self.zoom_edit.editingFinished.connect(self._on_zoom_edit)
-        self.zoom_edit.hide()
+        self.zoom_control.hide()
         self._position_overlays()
 
     # --- image setup ---
@@ -196,12 +221,19 @@ class ImageCanvas(QWidget):
         self._detail_rect_full = None
         self._full_w = self._full_h = 0
         self._um_per_px_full = 0.0
-        self.zoom_edit.hide()
+        self.zoom_control.hide()
+        self._scale_bar_hit_rect = QRectF()
+        self._scale_bar_drag_limits = None
+        self._scale_bar_hover = False
         self.update()
 
     def set_scale_bar_spec(self, spec=None):
         """Use an export-style scale bar overlay, or the ordinary auto bar."""
         self._custom_scale_bar = spec
+        if spec is None or not getattr(spec, "visible", False):
+            self._scale_bar_hit_rect = QRectF()
+            self._scale_bar_drag_limits = None
+            self._scale_bar_hover = False
         self.update()
 
     def set_empty_message(self, text: str):
@@ -334,13 +366,15 @@ class ImageCanvas(QWidget):
         pen.setWidth(3)
         p.setPen(pen)
         p.drawLine(int(x0), int(y), int(x1), int(y))
-        p.setFont(QFont("Menlo", 11, QFont.Weight.Bold))
+        p.setFont(QFont(SCALE_BAR_FONT_FAMILY, 11, QFont.Weight.Bold))
         p.drawText(QRect(int(x0 - 8), int(y - 24), int(length_px + 16), 18),
                    Qt.AlignmentFlag.AlignCenter, label)
 
     def _draw_custom_scale_bar(self, painter: QPainter, umpp_screen: float):
         spec = self._custom_scale_bar
         if not spec.visible:
+            self._scale_bar_hit_rect = QRectF()
+            self._scale_bar_drag_limits = None
             return
         il, it, ir, ib = self._image_screen_rect()
         max_width = max(1.0, min(300.0, (ir - il) * 0.28))
@@ -359,7 +393,7 @@ class ImageCanvas(QWidget):
         margin = max(5, min(70, int(spec.margin_px)))
         thick = max(1, min(20, int(spec.thickness_px)))
         font_size = max(8, min(24, int(round(spec.font_size_px * 0.7))))
-        font = QFont("Sans Serif")
+        font = QFont(SCALE_BAR_FONT_FAMILY)
         font.setPixelSize(font_size)
         font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(font)
@@ -367,13 +401,31 @@ class ImageCanvas(QWidget):
         label_h = metrics.height() if spec.show_label else 0
         gap = max(3, thick // 2)
         total_h = thick + (gap + label_h if spec.show_label else 0)
-        right = "right" in spec.position
-        bottom = "bottom" in spec.position
-        x = ir - margin - length_px if right else il + margin
-        y = ib - margin - total_h if bottom else it + margin
         text_w = metrics.horizontalAdvance(label) if spec.show_label else 0
         panel_w = max(length_px, text_w)
         pad = max(4, thick)
+        # Keep the complete bar panel inside the visible image.  A dragged
+        # position is stored as 0..1 so the same relative position is retained
+        # when a PNG/PDF/TIFF is exported at a different resolution.
+        margin_x = min(margin, max(0.0, (ir - il - panel_w) / 2.0))
+        margin_y = min(margin, max(0.0, (ib - it - total_h) / 2.0))
+        min_x = il + margin_x
+        max_x = max(min_x, ir - margin_x - panel_w)
+        min_y = it + margin_y
+        max_y = max(min_y, ib - margin_y - total_h)
+        anchor_x = getattr(spec, "anchor_x", None)
+        anchor_y = getattr(spec, "anchor_y", None)
+        if anchor_x is not None and anchor_y is not None:
+            x = min_x + max(0.0, min(1.0, float(anchor_x))) * (max_x - min_x)
+            y = min_y + max(0.0, min(1.0, float(anchor_y))) * (max_y - min_y)
+        else:
+            right = "right" in spec.position
+            bottom = "bottom" in spec.position
+            x = max_x if right else min_x
+            y = max_y if bottom else min_y
+        self._scale_bar_drag_limits = (min_x, max_x, min_y, max_y)
+        self._scale_bar_hit_rect = QRectF(
+            x - pad, y - pad, panel_w + 2 * pad, total_h + 2 * pad)
         if spec.background in {"dark", "light"}:
             background = QColor(0, 0, 0, 170) if spec.background == "dark" \
                 else QColor(255, 255, 255, 205)
@@ -391,6 +443,11 @@ class ImageCanvas(QWidget):
             painter.drawText(
                 QRect(int(x), int(y + thick + gap), int(max(panel_w, 1)), label_h),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+        if self._scale_bar_hover or self._dragging_scale_bar:
+            outline = QPen(QColor(59, 130, 246, 220), 1, Qt.PenStyle.DashLine)
+            painter.setPen(outline)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(self._scale_bar_hit_rect, 4, 4)
 
     # --- interaction ---
     def _apply_zoom(self, factor, center: QPointF):
@@ -429,20 +486,59 @@ class ImageCanvas(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
+            if (self._custom_scale_bar is not None
+                    and self._scale_bar_hit_rect.contains(event.position())
+                    and self._scale_bar_drag_limits is not None):
+                self._dragging_scale_bar = True
+                content_origin = self._scale_bar_hit_rect.topLeft() + QPointF(
+                    max(4, min(20, int(self._custom_scale_bar.thickness_px))),
+                    max(4, min(20, int(self._custom_scale_bar.thickness_px))))
+                self._scale_drag_offset = event.position() - content_origin
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
             self._dragging = True
             self._drag_start = event.position() - self._pan
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if self._dragging_scale_bar:
+            self._dragging_scale_bar = False
+            hover = self._scale_bar_hit_rect.contains(event.position())
+            self._scale_bar_hover = hover
+            self.setCursor(Qt.CursorShape.OpenHandCursor if hover
+                           else Qt.CursorShape.ArrowCursor)
+            self.update()
+            event.accept()
+            return
         self._dragging = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self._debounce.start()
 
     def mouseMoveEvent(self, event: QMouseEvent):
         pos = event.position()
-        if self._dragging:
+        if self._dragging_scale_bar and self._scale_bar_drag_limits is not None:
+            min_x, max_x, min_y, max_y = self._scale_bar_drag_limits
+            x = max(min_x, min(max_x, pos.x() - self._scale_drag_offset.x()))
+            y = max(min_y, min(max_y, pos.y() - self._scale_drag_offset.y()))
+            anchor_x = 0.0 if max_x == min_x else (x - min_x) / (max_x - min_x)
+            anchor_y = 0.0 if max_y == min_y else (y - min_y) / (max_y - min_y)
+            self._custom_scale_bar.anchor_x = anchor_x
+            self._custom_scale_bar.anchor_y = anchor_y
+            self._custom_scale_bar.position = "custom"
+            self.scale_bar_position_changed.emit(anchor_x, anchor_y)
+            self.update()
+        elif self._dragging:
             self._pan = pos - self._drag_start
             self.update()
+        else:
+            hover = (self._custom_scale_bar is not None
+                     and self._scale_bar_hit_rect.contains(pos))
+            if hover != self._scale_bar_hover:
+                self._scale_bar_hover = hover
+                self.setCursor(Qt.CursorShape.OpenHandCursor if hover
+                               else Qt.CursorShape.ArrowCursor)
+                self.update()
         fx, fy = self.screen_to_full(pos.x(), pos.y())
         self.cursor_moved.emit(fx, fy)
 
@@ -463,11 +559,12 @@ class ImageCanvas(QWidget):
 
     # --- zoom field overlay ---
     def _position_overlays(self):
-        self.zoom_edit.move(8, self.height() - self.zoom_edit.height() - 8)
+        self.zoom_control.move(8, self.height() - self.zoom_control.height() - 8)
 
     def _sync_zoom_field(self):
         if self._pixmap:
-            self.zoom_edit.show()
+            self.zoom_control.show()
+            self.zoom_control.raise_()
         if not self.zoom_edit.hasFocus():
             self.zoom_edit.setText(f"{self.screen_px_per_full_px * 100:.0f}%")
 
@@ -1192,6 +1289,8 @@ class MainWindow(QMainWindow):
         self.mosaic_workspace.export_requested.connect(self._export_mosaic)
         self.mosaic_workspace.views_changed.connect(self._rebuild_mosaic_preview)
         self.mosaic_workspace.scale_bar_changed.connect(self.canvas.set_scale_bar_spec)
+        self.canvas.scale_bar_position_changed.connect(
+            self.mosaic_workspace.set_scale_bar_position)
         self.mosaic_workspace.setVisible(False)
         rl.addWidget(self.mosaic_workspace, stretch=0)
         splitter.addWidget(right)
@@ -1334,7 +1433,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<b>{APP_NAME}</b> {__version__}<br><br>"
-            "広範囲モザイク／プレート画像／.ktf ビューア<br>"
+            "広範囲Stitching／プレート画像／.ktf ビューア<br>"
             "&copy; 2026 yoshi-koba-lab — All Rights Reserved.<br><br>"
             "UI: PySide6 6.10.3 / Qt 6.10.3<br>"
             "Qt for Python and Qt &copy; The Qt Company Ltd. and contributors; "
@@ -1607,10 +1706,10 @@ class MainWindow(QMainWindow):
         if (raw or wide) and self._plate_series_dock is not None:
             self._plate_series_dock.hide()
         self._update_series_export_state()
-        title = ("通常画像セット（広範囲モザイク）" if wide else
+        title = ("通常画像セット（広範囲Stitching）" if wide else
                  "プレート画像セット" if raw else ".ktf 表示")
         self.canvas.set_empty_message(
-            "画像セットをダブルクリックし、「モザイクを作成」を押してください"
+            "画像セットをダブルクリックし、「Stitching実行」を押してください"
             if wide else
             "プレート画像セットをダブルクリックし、ウェルを選択してください"
             if raw else
@@ -1773,7 +1872,7 @@ class MainWindow(QMainWindow):
             current.setText(2, f"{len(dataset.channels)} ch")
         self._commit_root()
         self.statusBar().showMessage(
-            f"{dataset.name}: {len(dataset.tiles)}視野を確認しました — 「モザイクを作成」を押してください")
+            f"{dataset.name}: {len(dataset.tiles)}視野を確認しました — 「Stitching実行」を押してください")
 
     def _on_mosaic_failed(self, message: str):
         self.statusBar().showMessage(f"通常画像セットを開けませんでした: {message}")
@@ -2371,7 +2470,7 @@ class MainWindow(QMainWindow):
         self._mosaic_build_worker.ready.connect(self._on_mosaic_ready)
         self._mosaic_build_worker.failed.connect(self._on_mosaic_build_failed)
         self._mosaic_build_worker.cancelled.connect(
-            lambda: self.statusBar().showMessage("モザイク作成を中止しました。"))
+            lambda: self.statusBar().showMessage("Stitching実行を中止しました。"))
         self._mosaic_build_worker.finished.connect(self._on_mosaic_worker_finished)
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
@@ -2383,9 +2482,9 @@ class MainWindow(QMainWindow):
         self._mosaic_build_worker.start()
 
     def _on_mosaic_build_failed(self, message: str):
-        self.statusBar().showMessage(f"モザイクを作成できませんでした: {message}")
+        self.statusBar().showMessage(f"Stitchingを実行できませんでした: {message}")
         QMessageBox.critical(
-            self, "モザイクを作成できません",
+            self, "Stitchingを実行できません",
             f"位置合わせまたは画像読込中に問題が発生しました。\n\n{message}")
 
     def _on_mosaic_ready(self, geometry, images, downsample: int):
@@ -2396,7 +2495,7 @@ class MainWindow(QMainWindow):
         self._rebuild_mosaic_preview(reset_view=True)
         self._show_mosaic_metadata()
         self.statusBar().showMessage(
-            f"モザイク完成: {geometry.output_shape[1]:,} × {geometry.output_shape[0]:,} px · "
+            f"Stitching完了: {geometry.output_shape[1]:,} × {geometry.output_shape[0]:,} px · "
             f"継ぎ目 {geometry.accepted_edges}/{geometry.expected_edges} を画像で確認")
 
     def _rebuild_mosaic_preview(self, reset_view=False):
@@ -2450,7 +2549,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("処理中です — 完了までお待ちください。")
             return
         if not self._mosaic_dataset or not self._mosaic_geometry:
-            self.statusBar().showMessage("先にモザイクを作成してください。")
+            self.statusBar().showMessage("先にStitchingを実行してください。")
             return
         extensions = {"ome": ".ome.tif", "png": ".png", "tiff": ".tif", "pdf": ".pdf"}
         filters = {
@@ -2468,7 +2567,7 @@ class MainWindow(QMainWindow):
                     path.with_name(path.stem + "_alignment.csv")]
 
         path = _ask_save_path(
-            self, "モザイクを書き出す", default, filters[kind], derived=derived)
+            self, "Stitching画像を書き出す", default, filters[kind], derived=derived)
         if path is None:
             return
         problem = _writable_problem(path.parent)
@@ -2495,7 +2594,7 @@ class MainWindow(QMainWindow):
         self._show_cancel_operation(True)
         self._set_actions_enabled(False)
         self.mosaic_workspace.setEnabled(False)
-        self.statusBar().showMessage("モザイクを書き出し中…")
+        self.statusBar().showMessage("Stitching画像を書き出し中…")
         self._mosaic_export_worker.start()
 
     def _on_mosaic_export_done(self, path: str):
@@ -2504,7 +2603,7 @@ class MainWindow(QMainWindow):
     def _on_mosaic_export_failed(self, message: str):
         self.statusBar().showMessage(f"書き出しに失敗しました: {message}")
         QMessageBox.critical(
-            self, "モザイクを書き出せません", _friendly_error(Exception(message)))
+            self, "Stitching画像を書き出せません", _friendly_error(Exception(message)))
 
     def _show_cancel_operation(self, visible: bool):
         button = getattr(self, "btn_cancel_operation", None)
@@ -2666,7 +2765,7 @@ class MainWindow(QMainWindow):
             self._mosaic_export_worker) if worker is not None and worker.isRunning()]
         if mosaic_workers:
             ans = QMessageBox.question(
-                self, "モザイク処理中です",
+                self, "Stitching処理中です",
                 "通常画像セットの処理が続いています。中止して終了しますか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
@@ -3528,7 +3627,7 @@ class StartModeDialog(QDialog):
              last_ktf, ".ktf画像セットを選ぶ…"),
         ]:
             box = QGroupBox(f"{number}  {title}")
-            box.setObjectName("primaryWorkflowCard" if mode == self.MOSAIC else "workflowCard")
+            box.setObjectName(f"{mode}WorkflowCard")
             v = QVBoxLayout(box)
             d = QLabel(desc)
             d.setWordWrap(True)
@@ -3540,8 +3639,7 @@ class StartModeDialog(QDialog):
                 p.setWordWrap(True)
                 v.addWidget(p)
             b = QPushButton(btn_text)
-            if mode == self.MOSAIC:
-                b.setObjectName("primaryExportButton")
+            b.setObjectName(f"{mode}WorkflowButton")
             b.clicked.connect(lambda _, m=mode: self._pick(m))
             v.addWidget(b)
             lay.addWidget(box)
@@ -3552,20 +3650,28 @@ class StartModeDialog(QDialog):
         lay.addWidget(bb)
         self.setStyleSheet("""
             QDialog { background:#f3f6fa; color:#1f2937; }
-            QGroupBox#workflowCard, QGroupBox#primaryWorkflowCard {
-                background:#ffffff; border:1px solid #d5dce6; border-radius:10px;
+            QGroupBox#mosaicWorkflowCard, QGroupBox#rawWorkflowCard,
+            QGroupBox#ktfWorkflowCard {
+                border:2px solid; border-radius:10px;
                 margin-top:12px; padding:14px 12px 10px 12px; font-weight:600;
             }
-            QGroupBox#primaryWorkflowCard { border:2px solid #4b8fda; }
-            QGroupBox#workflowCard::title, QGroupBox#primaryWorkflowCard::title {
+            QGroupBox#mosaicWorkflowCard { background:#eaf3ff; border-color:#6c9ed9; }
+            QGroupBox#rawWorkflowCard { background:#edf9f2; border-color:#64a979; }
+            QGroupBox#ktfWorkflowCard { background:#f5efff; border-color:#9274c9; }
+            QGroupBox#mosaicWorkflowCard::title, QGroupBox#rawWorkflowCard::title,
+            QGroupBox#ktfWorkflowCard::title {
                 subcontrol-origin:margin; left:14px; padding:0 5px;
             }
             QPushButton { min-height:30px; background:#ffffff; color:#1f2937;
                 border:1px solid #b9c4d2; border-radius:7px; padding:2px 12px; }
-            QPushButton:hover { background:#edf5ff; border-color:#4b8fda; }
-            QPushButton#primaryExportButton { background:#1674c5; color:#ffffff;
-                border-color:#1265ac; font-weight:700; }
-            QPushButton#primaryExportButton:hover { background:#0f67b4; }
+            QPushButton#mosaicWorkflowButton, QPushButton#rawWorkflowButton,
+            QPushButton#ktfWorkflowButton { color:#ffffff; font-weight:700; }
+            QPushButton#mosaicWorkflowButton { background:#2878c8; border-color:#1f66ad; }
+            QPushButton#mosaicWorkflowButton:hover { background:#1f69b5; }
+            QPushButton#rawWorkflowButton { background:#34865a; border-color:#2b704b; }
+            QPushButton#rawWorkflowButton:hover { background:#2b764e; }
+            QPushButton#ktfWorkflowButton { background:#7651b5; border-color:#62429a; }
+            QPushButton#ktfWorkflowButton:hover { background:#6845a5; }
         """)
 
     def _pick(self, mode):

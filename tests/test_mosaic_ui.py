@@ -13,12 +13,15 @@ import numpy as np
 from shiboken6 import Shiboken
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QSettings, QThread
 from PySide6.QtGui import QCloseEvent, QImage, QPixmap
-from PySide6.QtWidgets import QApplication, QGroupBox, QPushButton, QScrollArea
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import (
+    QApplication, QGroupBox, QLabel, QPushButton, QScrollArea,
+)
 
 import main
 import mosaic_engine
 import render
-from mosaic_ui import MosaicExportWorker
+from mosaic_ui import MosaicExportWorker, OutputQualityDialog, ScaleBarDialog
 
 
 class _RunningWorker:
@@ -77,6 +80,151 @@ class MosaicUiTests(unittest.TestCase):
             ("2  プレート画像セットを読み込む", "プレート画像セットを選ぶ…"),
             ("3  .ktfファイルを読み込む", ".ktf画像セットを選ぶ…"),
         ])
+        card_names = [
+            widget.objectName() for widget in dialog.findChildren(QGroupBox)
+        ]
+        button_names = [
+            button.objectName() for button in dialog.findChildren(QPushButton)
+            if button.objectName().endswith("WorkflowButton")
+        ]
+        self.assertEqual(card_names, [
+            "mosaicWorkflowCard", "rawWorkflowCard", "ktfWorkflowCard",
+        ])
+        self.assertEqual(button_names, [
+            "mosaicWorkflowButton", "rawWorkflowButton", "ktfWorkflowButton",
+        ])
+        stylesheet = dialog.styleSheet()
+        for color in ("#2878c8", "#34865a", "#7651b5"):
+            self.assertIn(color, stylesheet)
+
+    def test_mosaic_action_buttons_are_not_clipped_at_minimum_size(self):
+        window = self._window()
+        window._set_mode(main.StartModeDialog.MOSAIC)
+        window.resize(1200, 800)
+        window.show()
+        channels = tuple(
+            SimpleNamespace(
+                key=f"CH{index}", label=f"Channel {index}", color=None,
+                dtype=np.dtype("uint16"), file_tag="CHF",
+            )
+            for index in range(1, 4)
+        )
+        dataset = SimpleNamespace(
+            name="Example scan", grid_shape=(2, 2), tiles=tuple(range(4)),
+            pixel_size_um_yx=(0.65, 0.65), channels=channels, warnings=(),
+        )
+        window.mosaic_workspace.set_dataset(dataset)
+        self.app.processEvents()
+        self.assertEqual(
+            window.mosaic_workspace.title(),
+            "通常画像セット — 広範囲Stitching")
+        self.assertEqual(window.mosaic_workspace.build_button.text(), "Stitching実行")
+
+        buttons = [
+            window.mosaic_workspace.build_button,
+            window.mosaic_workspace.scale_button,
+            window.mosaic_workspace.quality_button,
+            *window.mosaic_workspace.export_buttons,
+        ]
+        for button in buttons:
+            with self.subTest(button=button.text()):
+                self.assertTrue(button.isVisible())
+                self.assertGreaterEqual(button.height(), button.fontMetrics().height() + 10)
+                self.assertGreaterEqual(
+                    button.width(), button.fontMetrics().horizontalAdvance(button.text()) + 12)
+        self.assertEqual(
+            [button.text() for button in window.mosaic_workspace.export_buttons],
+            ["OME-TIFF…", "PNG…", "TIFF…", "PDF…"])
+        self.assertEqual(window.mosaic_workspace.scale_button.text(), "スケールバー…")
+        self.assertEqual(window.mosaic_workspace.quality_button.text(), "出力品質…")
+        self.assertEqual(window.mosaic_workspace.presentation_max_side, 0)
+        self.assertIn("Maximum", window.mosaic_workspace.scale_summary.text())
+        for control in (
+                window.mosaic_workspace.reference_label,
+                window.mosaic_workspace.reference,
+                window.mosaic_workspace.blend_label,
+                window.mosaic_workspace.blend):
+            with self.subTest(control=control.objectName() or type(control).__name__):
+                self.assertTrue(control.isVisible())
+                self.assertGreaterEqual(control.height(), 30)
+                self.assertGreaterEqual(
+                    control.height(), control.fontMetrics().height() + 10)
+
+        window.mosaic_workspace.set_ready(True)
+        self.assertEqual(
+            window.mosaic_workspace.build_button.text(), "Stitching再実行")
+        window.mosaic_workspace.geometry = object()
+        window.mosaic_workspace._settings_changed()
+        self.assertEqual(
+            window.mosaic_workspace.build_button.text(),
+            "設定を反映してStitching再実行")
+
+    def test_scale_bar_preview_uses_arial(self):
+        self.assertEqual(main.SCALE_BAR_FONT_FAMILY, "Arial")
+        font = main.QFont(main.SCALE_BAR_FONT_FAMILY, 16)
+        self.assertEqual(font.family(), "Arial")
+
+    def test_zoom_is_an_explicit_numeric_control(self):
+        canvas = main.ImageCanvas()
+        self.addCleanup(canvas.close)
+        canvas.resize(400, 300)
+        canvas.show()
+        canvas.set_overview(QPixmap(200, 100), 2, 400, 200, 0.8)
+        self.app.processEvents()
+
+        labels = [label.text() for label in canvas.zoom_control.findChildren(QLabel)]
+        self.assertIn("倍率", labels)
+        self.assertTrue(canvas.zoom_control.isVisible())
+        canvas.zoom_edit.setText("150")
+        canvas.zoom_edit.editingFinished.emit()
+        self.assertAlmostEqual(canvas.screen_px_per_full_px, 1.5, places=6)
+        self.assertEqual(canvas.zoom_edit.text(), "150%")
+
+    def test_scale_bar_can_be_dragged_and_dialog_preserves_position(self):
+        canvas = main.ImageCanvas()
+        self.addCleanup(canvas.close)
+        canvas.resize(500, 340)
+        canvas.show()
+        canvas.set_overview(QPixmap(300, 160), 1, 300, 160, 1.0)
+        spec = mosaic_engine.ScaleBarSpec(length_um=50, show_label=False)
+        canvas.set_scale_bar_spec(spec)
+        moved = []
+        canvas.scale_bar_position_changed.connect(
+            lambda x, y: moved.append((x, y)))
+        self.app.processEvents()
+        canvas.repaint()
+        self.app.processEvents()
+
+        start = canvas._scale_bar_hit_rect.center().toPoint()
+        target = start + QPoint(120, -45)
+        QTest.mousePress(canvas, main.Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(canvas, target, delay=1)
+        QTest.mouseRelease(canvas, main.Qt.MouseButton.LeftButton, pos=target)
+        self.app.processEvents()
+        self.assertTrue(moved)
+        self.assertEqual(spec.position, "custom")
+        self.assertIsNotNone(spec.anchor_x)
+        self.assertIsNotNone(spec.anchor_y)
+
+        dialog = ScaleBarDialog(spec)
+        self.addCleanup(dialog.close)
+        self.assertEqual(dialog.position.currentData(), "custom")
+        retained = dialog.values()
+        self.assertAlmostEqual(retained.anchor_x, spec.anchor_x)
+        self.assertAlmostEqual(retained.anchor_y, spec.anchor_y)
+        dialog.position.setCurrentIndex(dialog.position.findData("top-right"))
+        corner = dialog.values()
+        self.assertIsNone(corner.anchor_x)
+        self.assertIsNone(corner.anchor_y)
+
+    def test_output_quality_defaults_to_unlimited_maximum(self):
+        dialog = OutputQualityDialog(0, 300)
+        self.addCleanup(dialog.close)
+        self.assertEqual(dialog.quality.currentText(), "Maximum（上限なし）")
+        self.assertEqual(dialog.values(), (0, 300))
+        dialog.quality.setCurrentIndex(dialog.quality.findData(8000))
+        dialog.dpi.setValue(600)
+        self.assertEqual(dialog.values(), (8000, 600))
 
     def test_about_discloses_pyside_and_lgpl(self):
         window = self._window()

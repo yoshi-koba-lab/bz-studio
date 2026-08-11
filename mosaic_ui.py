@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
-    QToolButton, QVBoxLayout, QWidget,
+    QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
 import mosaic
@@ -212,7 +212,7 @@ class MosaicExportWorker(QThread):
                     raise mosaic_engine.MosaicCancelled("cancelled")
                 decorated = mosaic_engine.draw_scale_bar(
                     Image.fromarray(rgb), pixel_um, self.scale_bar)
-                # The 12k presentation option is deliberately high resolution.
+                # Maximum can be substantially larger than the bounded options.
                 # Release the per-channel mosaics and composite before Pillow
                 # allocates its encoder buffers instead of holding every large
                 # representation through the final save.
@@ -311,14 +311,14 @@ class MosaicChannelRow(QWidget):
 
 
 class ScaleBarDialog(QDialog):
-    """Full scale-bar and presentation-resolution editor."""
+    """Scale-bar appearance editor."""
 
-    def __init__(self, spec: mosaic_engine.ScaleBarSpec, max_side: int, dpi: int,
-                 parent=None):
+    def __init__(self, spec: mosaic_engine.ScaleBarSpec, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("スケールバーと出力品質")
+        self.setWindowTitle("スケールバー")
         self.setMinimumWidth(470)
         self._color = tuple(spec.color)
+        self._original_anchor = (spec.anchor_x, spec.anchor_y)
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
@@ -339,14 +339,18 @@ class ScaleBarDialog(QDialog):
         self.auto_length.toggled.connect(lambda checked: self.length.setEnabled(not checked))
         length_layout.addWidget(self.auto_length)
         length_layout.addWidget(self.length, 1)
-        form.addRow("長さ", length_host)
+        form.addRow("バーの長さ（実寸）", length_host)
 
         self.position = QComboBox()
         self.position.addItem("左下", "bottom-left")
         self.position.addItem("右下", "bottom-right")
         self.position.addItem("左上", "top-left")
         self.position.addItem("右上", "top-right")
-        idx = self.position.findData(spec.position)
+        if spec.anchor_x is not None and spec.anchor_y is not None:
+            self.position.addItem("プレビューでドラッグした位置", "custom")
+        idx = self.position.findData(
+            "custom" if spec.anchor_x is not None and spec.anchor_y is not None
+            else spec.position)
         self.position.setCurrentIndex(max(0, idx))
         form.addRow("位置", self.position)
 
@@ -378,22 +382,13 @@ class ScaleBarDialog(QDialog):
         self.label.setPlaceholderText("空欄なら 1 mm / 500 µm などを自動表示")
         form.addRow("任意ラベル", self.label)
 
-        self.quality = QComboBox()
-        for label, value in (("標準（長辺 4,000 px）", 4000),
-                             ("高精細（長辺 8,000 px）", 8000),
-                             ("最高精細・高メモリ（長辺 12,000 px）", 12000)):
-            self.quality.addItem(label, value)
-        idx = self.quality.findData(max_side)
-        self.quality.setCurrentIndex(idx if idx >= 0 else 1)
-        form.addRow("PNG / PDF / 合成TIFF", self.quality)
-        self.dpi = QSpinBox(); self.dpi.setRange(72, 1200)
-        self.dpi.setValue(dpi); self.dpi.setSuffix(" dpi")
-        form.addRow("PDF / TIFF解像度", self.dpi)
         layout.addLayout(form)
 
         note = QLabel(
-            "スケールバーはPNG・PDF・合成TIFFのコピーだけに描画されます。"
-            "科学保存用OME-TIFFの画素には描き込みません。")
+            "長さは「自動」を外して数値指定できます。位置はプレビュー上の"
+            "スケールバーを直接ドラッグして変更できます。\n"
+            "スケールバーはPNG・TIFF・PDFに描画されます。"
+            "OME-TIFFの画素には描き込みません。字体はArialです。")
         note.setWordWrap(True)
         note.setStyleSheet("color:#64748b;font-size:11px;")
         layout.addWidget(note)
@@ -416,14 +411,61 @@ class ScaleBarDialog(QDialog):
             f"color:{'#111' if sum(self._color) > 420 else '#fff'};")
 
     def values(self):
+        position = self.position.currentData()
+        custom = position == "custom"
         spec = mosaic_engine.ScaleBarSpec(
             visible=self.visible.isChecked(),
             length_um=None if self.auto_length.isChecked() else self.length.value(),
-            position=self.position.currentData(), color=self._color,
+            position="custom" if custom else position,
+            anchor_x=self._original_anchor[0] if custom else None,
+            anchor_y=self._original_anchor[1] if custom else None,
+            color=self._color,
             thickness_px=self.thickness.value(), font_size_px=self.font_size.value(),
             margin_px=self.margin.value(), show_label=self.show_label.isChecked(),
             label=self.label.text().strip(), background=self.background.currentData())
-        return spec, int(self.quality.currentData()), self.dpi.value()
+        return spec
+
+
+class OutputQualityDialog(QDialog):
+    """Presentation resolution and file-DPI editor."""
+
+    def __init__(self, max_side: int, dpi: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("出力品質")
+        self.setMinimumWidth(430)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.quality = QComboBox()
+        for label, value in (
+                ("Maximum（上限なし）", 0),
+                ("High（長辺 12,000 px）", 12000),
+                ("Medium（長辺 8,000 px）", 8000),
+                ("Compact（長辺 4,000 px）", 4000)):
+            self.quality.addItem(label, value)
+        idx = self.quality.findData(int(max_side))
+        self.quality.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("PNG / TIFF / PDF", self.quality)
+        self.dpi = QSpinBox()
+        self.dpi.setRange(72, 1200)
+        self.dpi.setValue(dpi)
+        self.dpi.setSuffix(" dpi")
+        form.addRow("PDF / TIFF解像度", self.dpi)
+        layout.addLayout(form)
+        note = QLabel(
+            "MaximumはStitching結果を縮小せず、全ピクセルで書き出します。"
+            "大規模データでは処理時間とメモリ使用量が増えます。\n"
+            "OME-TIFFはこの設定に関係なく、常に全解像度です。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#64748b;font-size:11px;")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        return int(self.quality.currentData()), self.dpi.value()
 
 
 class MosaicWorkspace(QGroupBox):
@@ -435,12 +477,12 @@ class MosaicWorkspace(QGroupBox):
     scale_bar_changed = Signal(object)
 
     def __init__(self, parent=None):
-        super().__init__("通常画像セット — 広範囲モザイク", parent)
+        super().__init__("通常画像セット — 広範囲Stitching", parent)
         self.dataset = None
         self.geometry = None
         self.rows: dict[str, MosaicChannelRow] = {}
         self.scale_bar = mosaic_engine.ScaleBarSpec()
-        self.presentation_max_side = 8000
+        self.presentation_max_side = 0  # Maximum: no presentation downsampling
         self.presentation_dpi = 300
 
         outer = QHBoxLayout(self)
@@ -465,18 +507,35 @@ class MosaicWorkspace(QGroupBox):
         self.summary.setWordWrap(True)
         build_layout.addWidget(self.summary)
         form = QGridLayout()
-        form.addWidget(QLabel("基準"), 0, 0)
-        self.reference = QComboBox(); form.addWidget(self.reference, 0, 1)
-        form.addWidget(QLabel("継ぎ目"), 1, 0)
+        form.setHorizontalSpacing(7)
+        form.setVerticalSpacing(7)
+        form.setColumnStretch(1, 1)
+        self.reference_label = QLabel("基準")
+        self.reference_label.setMinimumHeight(30)
+        self.reference_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        form.addWidget(self.reference_label, 0, 0)
+        self.reference = QComboBox()
+        self.reference.setMinimumHeight(30)
+        self.reference.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        form.addWidget(self.reference, 0, 1)
+        self.blend_label = QLabel("継ぎ目")
+        self.blend_label.setMinimumHeight(30)
+        self.blend_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        form.addWidget(self.blend_label, 1, 0)
         self.blend = QComboBox()
+        self.blend.setMinimumHeight(30)
+        self.blend.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.blend.addItem("滑らか（表示向け）", "feather")
         self.blend.addItem("最近傍（定量向け）", "nearest")
         form.addWidget(self.blend, 1, 1)
         self.reference.currentIndexChanged.connect(self._settings_changed)
         self.blend.currentIndexChanged.connect(self._settings_changed)
         build_layout.addLayout(form)
-        self.build_button = QPushButton("モザイクを作成")
+        self.build_button = QPushButton("Stitching実行")
         self.build_button.setObjectName("primaryExportButton")
+        self.build_button.setMinimumHeight(34)
         self.build_button.setEnabled(False)
         self.build_button.clicked.connect(
             lambda: self.build_requested.emit(
@@ -490,30 +549,51 @@ class MosaicWorkspace(QGroupBox):
 
         export = QGroupBox("書き出し")
         export_layout = QVBoxLayout(export)
-        self.scale_button = QPushButton("スケールバーと出力品質…")
+        export_layout.setSpacing(5)
+        settings_row = QHBoxLayout()
+        settings_row.setContentsMargins(0, 0, 0, 0)
+        settings_row.setSpacing(4)
+        self.scale_button = QPushButton("スケールバー…")
+        self.scale_button.setMinimumHeight(32)
         self.scale_button.clicked.connect(self.edit_scale_bar)
-        export_layout.addWidget(self.scale_button)
+        settings_row.addWidget(self.scale_button, 1)
+        self.quality_button = QPushButton("出力品質…")
+        self.quality_button.setMinimumHeight(32)
+        self.quality_button.clicked.connect(self.edit_output_quality)
+        settings_row.addWidget(self.quality_button, 1)
+        export_layout.addLayout(settings_row)
         self.scale_summary = QLabel()
         self.scale_summary.setWordWrap(True)
         self.scale_summary.setStyleSheet("color:#64748b;font-size:10px;")
         export_layout.addWidget(self.scale_summary)
+        export_grid = QGridLayout()
+        export_grid.setContentsMargins(0, 0, 0, 0)
+        export_grid.setHorizontalSpacing(4)
+        export_grid.setVerticalSpacing(5)
         self.export_buttons = []
         for label, kind, tip in (
-            ("定量用 OME-TIFF…", "ome",
+            ("OME-TIFF…", "ome",
              "全チャンネル・全解像度。最近傍・輝度補正なしで元のDN値を保持"),
             ("PNG…", "png", "表示色とスケールバーを含む合成画像"),
-            ("合成TIFF…", "tiff", "表示色とスケールバーを含む高精細画像"),
+            ("TIFF…", "tiff", "表示色とスケールバーを含む高精細画像"),
             ("PDF…", "pdf", "表示色とスケールバーを含む1ページPDF"),
         ):
             button = QPushButton(label)
+            button.setMinimumHeight(30)
             button.setToolTip(tip)
             button.setEnabled(False)
             button.clicked.connect(lambda _=False, value=kind: self.export_requested.emit(value))
-            export_layout.addWidget(button)
+            if kind == "ome":
+                export_grid.addWidget(button, 0, 0, 1, 3)
+            else:
+                export_grid.addWidget(button, 1, {"png": 0, "tiff": 1, "pdf": 2}[kind])
             self.export_buttons.append(button)
+        for column in range(3):
+            export_grid.setColumnStretch(column, 1)
+        export_layout.addLayout(export_grid)
         outer.addWidget(export, 3)
-        self.setMinimumHeight(205)
-        self.setMaximumHeight(270)
+        self.setMinimumHeight(260)
+        self.setMaximumHeight(310)
         self._update_scale_summary()
 
     def clear(self):
@@ -586,30 +666,52 @@ class MosaicWorkspace(QGroupBox):
         if self.geometry is None:
             return
         self.set_ready(False)
-        self.build_button.setText("設定を反映して再作成")
-        self.qc.setText("基準チャンネルまたは継ぎ目方式を変更しました。再作成してください。")
+        self.build_button.setText("設定を反映してStitching再実行")
+        self.qc.setText(
+            "基準チャンネルまたは継ぎ目方式を変更しました。"
+            "Stitchingを再実行してください。")
 
     def set_ready(self, ready: bool):
         for button in self.export_buttons:
             button.setEnabled(bool(ready))
         self.scale_button.setEnabled(bool(self.dataset))
+        self.quality_button.setEnabled(bool(self.dataset))
         if ready:
-            self.build_button.setText("モザイクを再作成")
+            self.build_button.setText("Stitching再実行")
 
     def channel_views(self):
         return [self.rows[key].view() for key in self.rows]
 
     def edit_scale_bar(self):
-        dialog = ScaleBarDialog(
-            self.scale_bar, self.presentation_max_side, self.presentation_dpi, self)
+        dialog = ScaleBarDialog(self.scale_bar, self)
         dialog.setStyleSheet("")
         if dialog.exec():
-            self.scale_bar, self.presentation_max_side, self.presentation_dpi = dialog.values()
+            self.scale_bar = dialog.values()
             self._update_scale_summary()
             self.scale_bar_changed.emit(self.scale_bar)
 
+    def edit_output_quality(self):
+        dialog = OutputQualityDialog(
+            self.presentation_max_side, self.presentation_dpi, self)
+        dialog.setStyleSheet("")
+        if dialog.exec():
+            self.presentation_max_side, self.presentation_dpi = dialog.values()
+            self._update_scale_summary()
+
+    def set_scale_bar_position(self, anchor_x: float, anchor_y: float):
+        """Store a preview drag as resolution-independent export coordinates."""
+        self.scale_bar.anchor_x = max(0.0, min(1.0, float(anchor_x)))
+        self.scale_bar.anchor_y = max(0.0, min(1.0, float(anchor_y)))
+        self.scale_bar.position = "custom"
+        self._update_scale_summary()
+        self.scale_bar_changed.emit(self.scale_bar)
+
     def _update_scale_summary(self):
         length = "自動" if self.scale_bar.length_um is None else f"{self.scale_bar.length_um:g} µm"
-        shown = f"スケールバー {length}" if self.scale_bar.visible else "スケールバーなし"
+        position = "・ドラッグ位置" if self.scale_bar.anchor_x is not None else ""
+        shown = (f"スケールバー {length}{position}"
+                 if self.scale_bar.visible else "スケールバーなし")
+        quality = ("Maximum" if self.presentation_max_side <= 0
+                   else f"長辺 {self.presentation_max_side:,}px")
         self.scale_summary.setText(
-            f"{shown} · 長辺 {self.presentation_max_side:,}px · {self.presentation_dpi}dpi")
+            f"{shown}\n出力 {quality} · {self.presentation_dpi}dpi")
