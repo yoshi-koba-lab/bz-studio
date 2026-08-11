@@ -85,8 +85,10 @@ jobs:
           $smokeDir = Join-Path $env:RUNNER_TEMP "bz-studio-smoke"
           $env:BZ_STUDIO_PACKAGE_SMOKE = $smokeDir
           & "dist/BZ Studio/BZ Studio.exe"
+          $report = Join-Path $smokeDir "package-smoke.json"
+          if (Test-Path $report) { Get-Content $report }
           if ($LASTEXITCODE -ne 0) { throw "Packaged codec smoke test failed" }
-          python -c "import json,sys; assert json.load(open(sys.argv[1], encoding='utf-8'))['ok']" (Join-Path $smokeDir "package-smoke.json")
+          python -c "import json,sys; assert json.load(open(sys.argv[1], encoding='utf-8'))['ok']" $report
 
       - name: Zip bundle (macOS)
         if: runner.os == 'macOS'
