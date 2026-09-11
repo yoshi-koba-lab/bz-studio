@@ -1272,8 +1272,8 @@ class MainWindow(QMainWindow):
         self.raw_summary = QLabel("")
         self.raw_summary.setWordWrap(True)
         rp.addWidget(self.raw_summary)
-        hint = QLabel("各視野のタイルを貼り合わせて 1 枚のウェル画像にします。"
-                      "出力は OME-TIFF（Fiji / QuPath / napari で開けます）と PNG。")
+        hint = QLabel("各視野のタイルを貼り合わせて 1 枚のウェル画像にします。出力は "
+                      "OME-TIFF・チャンネルごとの TIFF / PNG・マージ PNG・PDF から選べます。")
         hint.setWordWrap(True); hint.setStyleSheet("color:#6b7280; font-size:11px;")
         rp.addWidget(hint)
         self.btn_stitch_raw = QPushButton("▶  プレートを貼り合わせて書き出す…")
@@ -2875,15 +2875,14 @@ class MainWindow(QMainWindow):
                    if stack else None)
         tgt = OutputTargetDialog(
             self, "貼り合わせた画像を名前を付けて保存", default_base,
-            StitchWorker.sample_name(dlg.fmt, stack), self._last_export_dir())
+            StitchWorker.sample_name(dlg.outputs, stack), self._last_export_dir())
         tgt.setStyleSheet("")
         if not tgt.exec():
             return
         out, base = tgt.folder, tgt.base
         self._remember_export_dir(tgt.root)
         if not _confirm_overwrite(
-                self, StitchWorker.planned_outputs(out, base, sorted(wells), dlg.fmt,
-                                                   stack_z)):
+                self, StitchWorker.planned_outputs(out, base, wells, dlg.outputs, stack_z)):
             return
 
         self._set_actions_enabled(False)
@@ -2896,7 +2895,7 @@ class MainWindow(QMainWindow):
         cond = self.conditions.to_dict()
         headers = cond.get("__headers__") or list(WellConditionsTable.DEFAULT_HEADERS)
         self._stitch_worker = StitchWorker(
-            wells, out, dlg.z_mode, dlg.fmt,
+            wells, out, dlg.z_mode, dlg.outputs,
             flatfield=dlg.flatfield, subpixel=dlg.subpixel,
             exp_name=self._raw_experiment["name"], base=base,
             conditions=cond, cond_headers=headers, z_step=dlg.z_step)
@@ -3215,78 +3214,15 @@ class MainWindow(QMainWindow):
     def _write_pdf_pages(path, pages, dpi, title):
         """Stream raster pages to an atomically committed PDF."""
         iterator = iter(pages)
-        page = next(iterator)
-        device = QSaveFile(str(path))
-        writer = None
-        painter = None
-        started = False
-        committed = False
+        writer = _PdfPageWriter(path, dpi, title)
         try:
-            if not device.open(QIODevice.OpenModeFlag.WriteOnly):
-                raise OSError(device.errorString() or "PDFの保存先を開けません")
-            writer = QPdfWriter(device)
-            writer.setResolution(int(dpi))
-            writer.setTitle(title)
-            writer.setCreator(f"{APP_NAME} {__version__}")
-            writer.setPageMargins(
-                QMarginsF(0, 0, 0, 0), QPageLayout.Unit.Millimeter)
-            painter = QPainter()
-
-            def paint_and_release(image):
-                """Keep full-page Qt/numpy buffers scoped to exactly one page."""
-                nonlocal started
-                rgb = image if image.mode == "RGB" else image.convert("RGB")
-                try:
-                    size = QPageSize(
-                        QSizeF(rgb.width * 25.4 / dpi, rgb.height * 25.4 / dpi),
-                        QPageSize.Unit.Millimeter)
-                    if not writer.setPageSize(size):
-                        raise OSError("PDFのページサイズを設定できません")
-                    if not started:
-                        if not painter.begin(writer):
-                            raise OSError("PDF writerを開始できません")
-                        started = True
-                    elif not writer.newPage():
-                        raise OSError("PDFに次のページを追加できません")
-                    arr = np.ascontiguousarray(np.asarray(rgb))
-                    qimg = QImage(
-                        arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 3,
-                        QImage.Format.Format_RGB888).copy()
-                    painter.drawImage(
-                        QRect(0, 0, writer.width(), writer.height()), qimg)
-                    del qimg, arr
-                finally:
-                    if rgb is not image:
-                        rgb.close()
-                    image.close()
-
-            while True:
-                paint_and_release(page)
-                page = None
-                try:
-                    page = next(iterator)
-                except StopIteration:
-                    break
-
-            if not painter.end():
-                raise OSError("PDF writerを終了できません")
-            painter = None
-            writer = None
-            if not device.commit():
-                raise OSError(device.errorString() or "PDFを保存できません")
-            committed = True
+            for page in iterator:
+                writer.add(page)
+            writer.close()
+        except BaseException:
+            writer.abort()
+            raise
         finally:
-            if page is not None:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-            if painter is not None and painter.isActive():
-                painter.end()
-            painter = None
-            writer = None
-            if not committed and device.isOpen():
-                device.cancelWriting()
             close = getattr(iterator, "close", None)
             if close is not None:
                 close()
@@ -4808,6 +4744,111 @@ def _looks_like_xy_scan(folder: Path) -> bool:
     return scan(folder, 3)
 
 
+class StitchOutputs:
+    """Which files a stitch run writes: separated channels, the merged view, or both.
+
+    `pdf` is "none", "pages" (one well per page), "sheet" (contact sheet) or
+    "sheet_pages" (contact sheet followed by one page per well).
+    """
+    __slots__ = ("ome", "split_tiff", "merged_png", "split_png", "pdf")
+
+    def __init__(self, ome=True, split_tiff=False, merged_png=True, split_png=False,
+                 pdf="none"):
+        self.ome = bool(ome)
+        self.split_tiff = bool(split_tiff)
+        self.merged_png = bool(merged_png)
+        self.split_png = bool(split_png)
+        self.pdf = pdf if pdf in ("none", "pages", "sheet", "sheet_pages") else "none"
+
+    @property
+    def any(self) -> bool:
+        return self.ome or self.split_tiff or self.merged_png or self.split_png \
+            or self.pdf != "none"
+
+    @property
+    def wants_composite(self) -> bool:
+        """Something needs the pseudo-colour merge rendered."""
+        return self.merged_png or self.pdf != "none"
+
+    @property
+    def wants_sheet(self) -> bool:
+        return self.pdf in ("sheet", "sheet_pages")
+
+
+def _file_label(plane) -> str:
+    """Channel label as a filename fragment (OME names can contain '/' or ':')."""
+    return _safe_base_name(plane.label) or plane.key
+
+
+class _PdfPageWriter:
+    """Raster pages → one PDF, added one at a time, committed atomically.
+
+    Push-based so a single page stream can feed this and other writers at once
+    (the Z-stack stitcher writes the OME-TIFF and the per-well PDF in one pass).
+    Nothing reaches the final path until close() succeeds.
+    """
+
+    def __init__(self, path, dpi, title):
+        self.dpi = int(dpi)
+        self.device = QSaveFile(str(path))
+        if not self.device.open(QIODevice.OpenModeFlag.WriteOnly):
+            raise OSError(self.device.errorString() or "PDFの保存先を開けません")
+        self.writer = QPdfWriter(self.device)
+        self.writer.setResolution(self.dpi)
+        self.writer.setTitle(title)
+        self.writer.setCreator(f"{APP_NAME} {__version__}")
+        self.writer.setPageMargins(QMarginsF(0, 0, 0, 0), QPageLayout.Unit.Millimeter)
+        self.painter = QPainter()
+        self.pages = 0
+
+    def add(self, image):
+        """Paint one PIL image as a page; the full-page buffers live only in this call."""
+        rgb = image if image.mode == "RGB" else image.convert("RGB")
+        try:
+            size = QPageSize(QSizeF(rgb.width * 25.4 / self.dpi, rgb.height * 25.4 / self.dpi),
+                             QPageSize.Unit.Millimeter)
+            if not self.writer.setPageSize(size):
+                raise OSError("PDFのページサイズを設定できません")
+            if self.pages == 0:
+                if not self.painter.begin(self.writer):
+                    raise OSError("PDF writerを開始できません")
+            elif not self.writer.newPage():
+                raise OSError("PDFに次のページを追加できません")
+            arr = np.ascontiguousarray(np.asarray(rgb))
+            qimg = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 3,
+                          QImage.Format.Format_RGB888).copy()
+            self.painter.drawImage(QRect(0, 0, self.writer.width(), self.writer.height()), qimg)
+            del qimg, arr
+            self.pages += 1
+        finally:
+            if rgb is not image:
+                rgb.close()
+            image.close()
+
+    def close(self):
+        """Finish and commit. Raises — leaving no file behind — if nothing was added."""
+        try:
+            if self.pages == 0:
+                raise OSError("PDFに書き出すページがありません")
+            if not self.painter.end():
+                raise OSError("PDF writerを終了できません")
+            self.painter = None
+            self.writer = None                 # release the engine before committing
+            if not self.device.commit():
+                raise OSError(self.device.errorString() or "PDFを保存できません")
+        except BaseException:
+            self.abort()
+            raise
+
+    def abort(self):
+        if self.painter is not None and self.painter.isActive():
+            self.painter.end()
+        self.painter = None
+        self.writer = None
+        if self.device.isOpen():
+            self.device.cancelWriting()
+
+
 class StitchDialog(QDialog):
     """Options for rebuilding whole-well mosaics from the raw BZ-X tiles."""
 
@@ -4866,19 +4907,30 @@ class StitchDialog(QDialog):
             self.cmb_z = None
             self.spin_step = None
 
-        form.addWidget(QLabel("Output:"), r, 0)
-        self.cmb_fmt = QComboBox()
-        self.cmb_fmt.addItems([
-            "OME-TIFF (multi-channel) + PNG preview",
-            "OME-TIFF (multi-channel) only",
-            "PNG composite only",
-            "Separate TIFF per channel",
-            "PDF (1 well per page)",
-            "PDF contact sheet (all wells on one page)",
-            "PDF: contact sheet + one well per page",
-            "OME-TIFF + PDF contact sheet",
+        form.addWidget(QLabel("画像:"), r, 0)
+        img_col = QVBoxLayout()
+        img_col.setSpacing(2)
+        self.chk_ome = QCheckBox("OME-TIFF（全チャンネルを 1 ファイルに・元のビット深度）")
+        self.chk_ome.setChecked(True)
+        self.chk_split_tiff = QCheckBox("チャンネルごとの TIFF（分離・元のビット深度）")
+        self.chk_merged_png = QCheckBox("マージ画像 PNG（疑似カラー合成・表示用）")
+        self.chk_merged_png.setChecked(True)
+        self.chk_split_png = QCheckBox("チャンネルごとの PNG（分離・グレースケール・表示用）")
+        for c in (self.chk_ome, self.chk_split_tiff, self.chk_merged_png, self.chk_split_png):
+            img_col.addWidget(c)
+            c.toggled.connect(self._refresh_outputs)
+        form.addLayout(img_col, r, 1); r += 1
+
+        form.addWidget(QLabel("PDF:"), r, 0)
+        self.cmb_pdf = QComboBox()
+        self.cmb_pdf.addItems([
+            "なし",
+            "1 ウェル 1 ページ（Conditions 付き）",
+            "コンタクトシート（全ウェルを 1 ページに）",
+            "コンタクトシート + 1 ウェル 1 ページ",
         ])
-        form.addWidget(self.cmb_fmt, r, 1); r += 1
+        self.cmb_pdf.currentIndexChanged.connect(self._refresh_outputs)
+        form.addWidget(self.cmb_pdf, r, 1); r += 1
         lay.addLayout(form)
 
         self.chk_flat = QCheckBox("照明ムラ補正（フラットフィールド）")
@@ -4903,18 +4955,23 @@ class StitchDialog(QDialog):
         self.z_note.setVisible(False)
         lay.addWidget(self.z_note)
 
-        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                               QDialogButtonBox.StandardButton.Cancel)
-        box.button(QDialogButtonBox.StandardButton.Ok).setText("保存先と名前を指定…")
-        box.accepted.connect(self.accept)
-        box.rejected.connect(self.reject)
-        lay.addWidget(box)
+        self.box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                    QDialogButtonBox.StandardButton.Cancel)
+        self.box.button(QDialogButtonBox.StandardButton.Ok).setText("保存先と名前を指定…")
+        self.box.accepted.connect(self.accept)
+        self.box.rejected.connect(self.reject)
+        lay.addWidget(self.box)
         self._refresh_z()
+        self._refresh_outputs()
 
-    #: what each output format does with a Z stack — shown only in stack mode
-    STACK_NOTE = ("Zスタック出力: OME-TIFF は Z 軸付きの 1 ファイル、チャンネル別 TIFF は"
-                  "多ページ、PNG と「PDF (1 well per page)」はスライスごとに書き出します。"
-                  "コンタクトシートと OME-TIFF の PNG プレビューは全焦点合成の 1 枚です。")
+    #: what each output does with a Z stack — shown only in stack mode
+    STACK_NOTE = ("Zスタック出力: OME-TIFF は Z 軸付きの 1 ファイル、チャンネルごとの TIFF は"
+                  "多ページ。PNG（マージ／チャンネルごと）と「1 ウェル 1 ページ」の PDF は"
+                  "スライスごとに書き出します。コンタクトシートは全焦点合成の 1 枚です。")
+
+    def _refresh_outputs(self):
+        """Nothing to write means nothing to run: keep OK disabled until something is ticked."""
+        self.box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(self.outputs.any)
 
     def _refresh_z(self):
         if self.cmb_z is None:
@@ -4944,10 +5001,11 @@ class StitchDialog(QDialog):
         return self.spin_step.value()
 
     @property
-    def fmt(self):
-        return ["both", "ometiff", "png", "split",
-                "pdf_pages", "pdf_sheet", "pdf_sheet_pages",
-                "ometiff_pdf"][self.cmb_fmt.currentIndex()]
+    def outputs(self) -> StitchOutputs:
+        return StitchOutputs(
+            ome=self.chk_ome.isChecked(), split_tiff=self.chk_split_tiff.isChecked(),
+            merged_png=self.chk_merged_png.isChecked(), split_png=self.chk_split_png.isChecked(),
+            pdf=("none", "pages", "sheet", "sheet_pages")[self.cmb_pdf.currentIndex()])
 
     @property
     def flatfield(self):
@@ -4963,57 +5021,57 @@ class StitchWorker(QThread):
     progress = Signal(str, float)          # message, 0..1
     done = Signal(int, int, str)           # ok, failed, out_dir
 
-    #: what one output file looks like, per format — shown in the Save-As preview
-    SAMPLE_NAME = {
-        "both": "{base}_A01.ome.tif",
-        "ometiff": "{base}_A01.ome.tif",
-        "png": "{base}_A01.png",
-        "split": "{base}_A01_CH1.tif",
-        "pdf_pages": "{base}_A01.pdf",
-        "pdf_sheet": "{base}_plate.pdf",
-        "pdf_sheet_pages": "{base}_plate_and_wells.pdf",
-        "ometiff_pdf": "{base}_A01.ome.tif",
-    }
-
-    @classmethod
-    def sample_name(cls, fmt: str, stack: bool = False) -> str:
-        """Example filename for the Save-As preview."""
-        if stack and fmt == "png":
-            return "{base}_A01_Z001.png"
-        return cls.SAMPLE_NAME.get(fmt, "{base}_A01.tif")
+    @staticmethod
+    def sample_name(outputs: StitchOutputs, stack: bool = False) -> str:
+        """Example filename for the Save-As preview — the first thing that gets written."""
+        z = "_Z001" if stack else ""
+        if outputs.ome:
+            return "{base}_A01.ome.tif"
+        if outputs.split_tiff:
+            return "{base}_A01_CH1.tif"
+        if outputs.merged_png:
+            return "{base}_A01" + z + ".png"
+        if outputs.split_png:
+            return "{base}_A01_CH1" + z + ".png"
+        return {"pages": "{base}_A01.pdf", "sheet": "{base}_plate.pdf",
+                "sheet_pages": "{base}_plate_and_wells.pdf"}.get(
+                    outputs.pdf, "{base}_stitch_qc.csv")
 
     @staticmethod
-    def planned_outputs(out: Path, base: str, wids, fmt, stack_z: dict = None) -> list:
+    def planned_outputs(out: Path, base: str, wells: dict, outputs: StitchOutputs,
+                        stack_z: dict = None) -> list:
         """Every file this run will write, so nothing is replaced without asking.
 
         Kept next to `_write` / `_write_stack`, the only places these names are
         produced — they must agree or the warning silently misses files.
+        `wells` maps well → WellTiles (the channel labels come from its planes);
         `stack_z` maps well → kept Z values when slices are written one by one.
         """
         out, paths = Path(out), []
-        for wid in wids:
-            if fmt in ("ometiff", "both", "ometiff_pdf"):
+        for wid in sorted(wells):
+            labels = [_file_label(p) for p in wells[wid].planes]
+            zs = stack_z.get(wid, []) if stack_z is not None else None
+            if outputs.ome:
                 paths.append(out / f"{base}_{wid}.ome.tif")
-            if fmt == "png" and stack_z is not None:
-                paths += [out / f"{base}_{wid}_Z{z:03d}.png" for z in stack_z.get(wid, [])]
-            elif fmt in ("png", "both"):
-                paths.append(out / f"{base}_{wid}.png")
-            if fmt == "pdf_pages":
+            if outputs.split_tiff:
+                paths += [out / f"{base}_{wid}_{lb}.tif" for lb in labels]
+            if outputs.merged_png:
+                paths += ([out / f"{base}_{wid}_Z{z:03d}.png" for z in zs]
+                          if zs is not None else [out / f"{base}_{wid}.png"])
+            if outputs.split_png:
+                paths += ([out / f"{base}_{wid}_{lb}_Z{z:03d}.png" for z in zs for lb in labels]
+                          if zs is not None else
+                          [out / f"{base}_{wid}_{lb}.png" for lb in labels])
+            if outputs.pdf == "pages":
                 paths.append(out / f"{base}_{wid}.pdf")
-            if fmt == "split":
-                # channel labels are only known after stitching, so match on the stem
-                try:
-                    paths += sorted(out.glob(f"{base}_{wid}_*.tif"))
-                except OSError:
-                    pass
-        if fmt in ("pdf_sheet", "ometiff_pdf"):
+        if outputs.pdf == "sheet":
             paths.append(out / f"{base}_plate.pdf")
-        if fmt == "pdf_sheet_pages":
+        if outputs.pdf == "sheet_pages":
             paths.append(out / f"{base}_plate_and_wells.pdf")
         paths.append(out / f"{base}_stitch_qc.csv")
         return paths
 
-    def __init__(self, wells, out_dir, z_mode, fmt, flatfield=True, subpixel=True,
+    def __init__(self, wells, out_dir, z_mode, outputs, flatfield=True, subpixel=True,
                  exp_name="experiment", base="", conditions=None, cond_headers=None,
                  z_step=1):
         super().__init__()
@@ -5027,7 +5085,7 @@ class StitchWorker(QThread):
         self.out_dir = Path(out_dir)
         self.z_mode = z_mode
         self.z_step = max(1, int(z_step))
-        self.fmt = fmt
+        self.outputs = outputs
         self.flatfield = flatfield
         self.subpixel = subpixel
         self.warnings = []
@@ -5105,8 +5163,7 @@ class StitchWorker(QThread):
                 self.warnings.append(f"{wid}: {_friendly_error(e)}")
                 failed += 1
 
-        if self.fmt in ("pdf_sheet", "pdf_sheet_pages", "ometiff_pdf") \
-                and self.sheet_panels and not self._cancel:
+        if self.outputs.wants_sheet and self.sheet_panels and not self._cancel:
             self.progress.emit("コンタクトシート PDF を作成中…", -1.0)
             try:
                 self._write_contact_sheet()
@@ -5217,101 +5274,108 @@ class StitchWorker(QThread):
             images[p.key] = img
         return Image.fromarray(render.composite(views, images))
 
+    @staticmethod
+    def _gray(img, levels=None):
+        """Display-stretched grayscale of one channel — the Solo look, as a file."""
+        lo, hi = levels or stitcher._display_levels([img])
+        return Image.fromarray((render.apply_levels(img, lo, hi, 1.0) * 255.0).astype(np.uint8))
+
     def _write(self, wid, wt, res):
         planes_data = [(p, img) for (p, img) in res.values()]
         pixel_um = stitcher.tile_pixel_um(wt)
+        o = self.outputs
         # Names must stay in step with planned_outputs(), which is what the user
         # was shown and agreed to overwrite.
-        if self.fmt in ("ometiff", "both", "ometiff_pdf"):
+        if o.ome:
             stitcher.save_ome_tiff(
                 self.out_dir / f"{self.base}_{wid}.ome.tif", planes_data, pixel_um)
-        if self.fmt == "split":
-            for p, img in planes_data:
-                Image.fromarray(img).save(self.out_dir / f"{self.base}_{wid}_{p.label}.tif")
-        if self.fmt in ("png", "both"):
-            self._composite(planes_data).save(self.out_dir / f"{self.base}_{wid}.png")
-        if self.fmt == "pdf_pages":
-            im = self._composite(planes_data)
+        for p, img in planes_data:
+            if o.split_tiff:
+                Image.fromarray(img).save(self.out_dir / f"{self.base}_{wid}_{_file_label(p)}.tif")
+            if o.split_png:
+                self._gray(img).save(self.out_dir / f"{self.base}_{wid}_{_file_label(p)}.png")
+        if not o.wants_composite:
+            return
+        im = self._composite(planes_data)      # rendered once, shared by every merged output
+        if o.merged_png:
+            im.save(self.out_dir / f"{self.base}_{wid}.png")
+        if o.pdf == "pages":
             self._label_and_save_pdf(im, wid, self.out_dir / f"{self.base}_{wid}.pdf")
-        if self.fmt == "pdf_sheet_pages":
+        if o.pdf == "sheet_pages":
             # a page per well, appended after the overview sheet in ONE document
-            self.well_pages.append((wid, self._page_for(self._composite(planes_data), wid)))
-        if self.fmt in ("pdf_sheet", "pdf_sheet_pages", "ometiff_pdf"):
+            self.well_pages.append((wid, self._page_for(im, wid)))
+        if o.wants_sheet:
             # keep a downscaled panel; the full sheet is written once at the end
-            im = self._composite(planes_data)
             im.thumbnail((self.SHEET_PANEL, self.SHEET_PANEL), Image.Resampling.LANCZOS)
             self.sheet_panels[wid] = im
 
     def _write_stack(self, wid, wt, res):
         """Stream every kept Z slice to disk; one mosaic is alive at a time.
 
-        Names must stay in step with planned_outputs(). The OME-TIFF and the
-        per-well PDF writers are pull-based, so whichever one the format needs
-        drives the page stream, and everything else — per-slice PNGs, per-channel
-        TIFF pages, the all-in-focus preview — happens as the pages go by.
+        Names must stay in step with planned_outputs(). The OME-TIFF writer is
+        pull-based (tifffile's iterator API), so when it is wanted it drives the
+        page stream; every other output — per-channel TIFF pages, per-slice PNGs,
+        the per-well PDF, the all-in-focus contact-sheet panel — is pushed one
+        page at a time as the stream goes by.
         """
         planes, zs, levels = res["planes"], res["z_values"], res["levels"]
-        shape, fmt = res["shape"], self.fmt
+        shape, o = res["shape"], self.outputs
         pixel_um = stitcher.tile_pixel_um(wt)
-        want_composite = fmt not in ("ometiff", "split")
-        fusion = (stitcher.FocusFusion()
-                  if fmt in ("both", "pdf_sheet", "pdf_sheet_pages", "ometiff_pdf")
-                  else None)
+        fusion = stitcher.FocusFusion() if o.wants_sheet else None
 
         split_writers = {}
-        if fmt == "split":
+        if o.split_tiff:
             import tifffile
             for p in planes:
-                tmp = self.out_dir / f"{self.base}_{wid}_{p.label}.tif.part"
+                tmp = self.out_dir / f"{self.base}_{wid}_{_file_label(p)}.tif.part"
                 big = len(zs) * shape[0] * shape[1] * np.dtype(res["dtypes"][p.key]).itemsize
                 split_writers[p.key] = (tmp, tifffile.TiffWriter(str(tmp), bigtiff=big > 2 ** 31))
-
+        pdf = (_PdfPageWriter(self.out_dir / f"{self.base}_{wid}.pdf", 300,
+                              f"{self.exp_name} {wid}")
+               if o.pdf == "pages" else None)
         current = {}                    # plane.key → mosaic of the z being assembled
 
         def on_page(plane, z, mosaic):
-            """Fan one page out to the push-based consumers; returns the z's composite."""
+            """Fan one page out to every push-based consumer."""
             if plane.key in split_writers:
                 split_writers[plane.key][1].write(mosaic, contiguous=True,
                                                   photometric="minisblack")
-            if not want_composite:
-                return None
+            if o.split_png:
+                self._gray(mosaic, levels.get(plane.key)).save(
+                    self.out_dir / f"{self.base}_{wid}_{_file_label(plane)}_Z{z:03d}.png")
+            if not o.wants_composite:
+                return
             current[plane.key] = mosaic
             if len(current) < len(planes):
-                return None
+                return
             comp = self._composite([(p, current[p.key]) for p in planes], levels)
             current.clear()
-            if fmt == "png":
+            if o.merged_png:
                 comp.save(self.out_dir / f"{self.base}_{wid}_Z{z:03d}.png")
             if fusion is not None:
                 fusion.add(np.asarray(comp))
-            return comp
+            if pdf is not None:
+                pdf.add(self._page_for(comp, wid, f"Z {zs.index(z) + 1}/{len(zs)}"))
 
         def stream():
             for plane, z, mosaic in res["pages"]:
                 on_page(plane, z, mosaic)
                 yield mosaic
 
-        def composites():
-            for plane, z, mosaic in res["pages"]:
-                comp = on_page(plane, z, mosaic)
-                if comp is not None:
-                    yield comp
-
         try:
-            if fmt in ("ometiff", "both", "ometiff_pdf"):
+            if o.ome:
                 dtype = np.result_type(*[res["dtypes"][p.key] for p in planes])
                 stitcher.save_ome_tiff_stack(
                     self.out_dir / f"{self.base}_{wid}.ome.tif", planes, len(zs),
                     stream(), dtype, shape, pixel_um)
-            elif fmt == "pdf_pages":
-                pages = (self._page_for(comp, wid, f"Z {i + 1}/{len(zs)}")
-                         for i, comp in enumerate(composites()))
-                MainWindow._write_pdf_pages(self.out_dir / f"{self.base}_{wid}.pdf",
-                                            pages, 300, f"{self.exp_name} {wid}")
             else:
-                for _ in composites():  # nothing pulls, so drive the stream here
+                for _ in stream():      # nothing pulls, so drive the stream here
                     pass
+            if pdf is not None:
+                pdf.close()
         except BaseException:
+            if pdf is not None:
+                pdf.abort()
             for tmp, writer in split_writers.values():
                 writer.close()
                 tmp.unlink(missing_ok=True)
@@ -5323,13 +5387,10 @@ class StitchWorker(QThread):
         if fusion is None or fusion.result() is None:
             return
         fused = Image.fromarray(fusion.result())
-        if fmt == "both":
-            fused.save(self.out_dir / f"{self.base}_{wid}.png")
-        if fmt == "pdf_sheet_pages":
+        if o.pdf == "sheet_pages":
             self.well_pages.append((wid, self._page_for(fused, wid, "全焦点合成")))
-        if fmt in ("pdf_sheet", "pdf_sheet_pages", "ometiff_pdf"):
-            fused.thumbnail((self.SHEET_PANEL, self.SHEET_PANEL), Image.Resampling.LANCZOS)
-            self.sheet_panels[wid] = fused
+        fused.thumbnail((self.SHEET_PANEL, self.SHEET_PANEL), Image.Resampling.LANCZOS)
+        self.sheet_panels[wid] = fused
 
     #: long edge of each well panel on the contact sheet
     SHEET_PANEL = 1100

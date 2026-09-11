@@ -1,5 +1,8 @@
-"""Z-stack handling of the plate stitcher: full-focus fusion, every-Nth-slice
-stack output, the writers behind each format, and the stitch button pulse.
+"""Z-stack handling of the plate stitcher and its selectable outputs.
+
+Covers full-focus fusion, every-Nth-slice stack output, the writers behind
+each output (OME-TIFF, per-channel TIFF/PNG, merged PNG, per-well PDF, contact
+sheet), the dialog that selects them, and the stitch button pulse.
 
 Every check is against exact truth: the synthetic stack is built from a known
 sharp scene whose in-focus depth varies across the field, so the fused image
@@ -26,6 +29,7 @@ from pypdf import PdfReader
 
 import main
 import stitcher
+from main import StitchOutputs
 
 _SETTINGS_HOME = tempfile.TemporaryDirectory(prefix="bz-zstack-settings-")
 
@@ -92,6 +96,21 @@ def _make_z_capture(folder: Path, n_z: int = N_Z, seed: int = 20260911) -> dict:
 
 def _mae(a, b) -> float:
     return float(np.abs(np.asarray(a, np.float32) - np.asarray(b, np.float32)).mean())
+
+
+def _corr(a, b) -> float:
+    return float(np.corrcoef(np.asarray(a, np.float32).ravel(),
+                             np.asarray(b, np.float32).ravel())[0, 1])
+
+
+def _qt_app():
+    app = QApplication.instance() or QApplication([])
+    app.setOrganizationName("BZStudioZStackTests")
+    app.setApplicationName("BZ Studio z-stack tests")
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
+                      _SETTINGS_HOME.name)
+    return app
 
 
 class FocusFusionTests(unittest.TestCase):
@@ -180,15 +199,12 @@ class StackStitchTests(unittest.TestCase):
         self.assertLess(_mae(res["CH1"][1], 255 - sharp.astype(np.int16)), 4.0)
 
 
-class StackWorkerTests(unittest.TestCase):
+class _WorkerCase(unittest.TestCase):
+    """Runs StitchWorker synchronously and checks written names == planned names."""
+
     @classmethod
     def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
-        cls.app.setOrganizationName("BZStudioZStackTests")
-        cls.app.setApplicationName("BZ Studio z-stack tests")
-        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
-        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
-                          _SETTINGS_HOME.name)
+        cls.app = _qt_app()
 
     def setUp(self):
         settings = QSettings()
@@ -199,27 +215,32 @@ class StackWorkerTests(unittest.TestCase):
         self.capture = Path(self.temp.name) / "Capture"
         self.truth = _make_z_capture(self.capture)
         self.wells = stitcher.discover_wells(self.capture)
+        self.order = [p.channel for p in self.wells["A01"].planes]
+        self.labels = {"CH4": "Brightfield", "CH1": "Green"}
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def _run(self, fmt, z_step=1):
-        out = Path(self.temp.name) / f"out_{fmt}"
+    def _run(self, outputs, z_mode="stack", z_step=1, tag=""):
+        out = Path(self.temp.name) / f"out{tag}"
         out.mkdir()
-        worker = main.StitchWorker(self.wells, out, "stack", fmt, flatfield=False,
+        worker = main.StitchWorker(self.wells, out, z_mode, outputs, flatfield=False,
                                    subpixel=False, exp_name="Exp", base="run",
                                    z_step=z_step)
         worker.run()                     # synchronous: this is the QThread body
         written = sorted(p.name for p in out.iterdir() if not p.name.endswith(".part"))
-        stack_z = {w: list(wt.z_values[::z_step]) for w, wt in self.wells.items()}
+        stack_z = ({w: list(wt.z_values[::z_step]) for w, wt in self.wells.items()}
+                   if z_mode == "stack" else None)
         planned = sorted({Path(p).name for p in main.StitchWorker.planned_outputs(
-            out, "run", sorted(self.wells), fmt, stack_z)})
-        self.assertEqual(written, planned, f"[{fmt}] planned names ≠ written names")
+            out, "run", self.wells, outputs, stack_z)})
+        self.assertEqual(written, planned, "planned names ≠ written names")
         self.assertEqual(worker.warnings, [])
         return out
 
+
+class StackWorkerTests(_WorkerCase):
     def test_ome_tiff_carries_the_z_axis(self):
-        out = self._run("both")
+        out = self._run(StitchOutputs(ome=True, merged_png=False))
         with tifffile.TiffFile(str(out / "run_A01.ome.tif")) as tf:
             self.assertTrue(tf.is_ome)
             series = tf.series[0]
@@ -227,22 +248,20 @@ class StackWorkerTests(unittest.TestCase):
             arr = series.asarray()
         h, w = self.truth["CH4"][0].shape
         self.assertEqual(arr.shape, (N_Z, 2, h, w))
-        order = [p.channel for p in self.wells["A01"].planes]
         for z in range(N_Z):
-            for c, ch in enumerate(order):
+            for c, ch in enumerate(self.order):
                 self.assertLessEqual(int(np.abs(
                     arr[z, c].astype(np.int16) - self.truth[ch][z].astype(np.int16)).max()), 1)
-        # the preview next to it is the all-in-focus composite, not a slice
-        preview = np.asarray(Image.open(out / "run_A01.png"))
-        self.assertEqual(preview.shape, (h, w, 3))
 
-    def test_png_writes_one_file_per_slice(self):
-        out = self._run("png", z_step=2)
+    def test_merged_png_writes_one_file_per_slice(self):
+        out = self._run(StitchOutputs(ome=False, merged_png=True), z_step=2)
         names = sorted(p.name for p in out.glob("*.png"))
         self.assertEqual(names, ["run_A01_Z000.png", "run_A01_Z002.png", "run_A01_Z004.png"])
+        with Image.open(out / "run_A01_Z000.png") as im:
+            self.assertEqual(im.mode, "RGB")
 
     def test_split_tiff_has_a_page_per_slice(self):
-        out = self._run("split")
+        out = self._run(StitchOutputs(ome=False, merged_png=False, split_tiff=True))
         for label in ("Brightfield", "Green"):
             arr = tifffile.imread(str(out / f"run_A01_{label}.tif"))
             self.assertEqual(arr.shape[0], N_Z, label)
@@ -251,24 +270,95 @@ class StackWorkerTests(unittest.TestCase):
             self.assertLessEqual(int(np.abs(
                 bf[z].astype(np.int16) - self.truth["CH4"][z].astype(np.int16)).max()), 1)
 
+    def test_split_png_is_a_stretched_grayscale_per_slice(self):
+        out = self._run(StitchOutputs(ome=False, merged_png=False, split_png=True), z_step=2)
+        names = sorted(p.name for p in out.glob("*.png"))
+        self.assertEqual(names, sorted(
+            f"run_A01_{lb}_Z{z:03d}.png" for lb in ("Brightfield", "Green") for z in (0, 2, 4)))
+        with Image.open(out / "run_A01_Brightfield_Z002.png") as im:
+            self.assertEqual(im.mode, "L")
+            self.assertGreater(_corr(np.asarray(im), self.truth["CH4"][2]), 0.98)
+
     def test_pdf_has_a_page_per_slice(self):
-        out = self._run("pdf_pages")
+        out = self._run(StitchOutputs(ome=False, merged_png=False, pdf="pages"))
         self.assertEqual(len(PdfReader(str(out / "run_A01.pdf")).pages), N_Z)
 
+    def test_everything_at_once_including_ome_and_pdf(self):
+        # OME-TIFF pulls the stream while the PDF (push-based) is fed from the same pass
+        out = self._run(StitchOutputs(ome=True, split_tiff=True, merged_png=True,
+                                      split_png=True, pdf="pages"))
+        self.assertEqual(len(PdfReader(str(out / "run_A01.pdf")).pages), N_Z)
+        self.assertEqual(tifffile.imread(str(out / "run_A01.ome.tif")).shape[:2], (N_Z, 2))
+        self.assertEqual(len(list(out.glob("run_A01_Z*.png"))), N_Z)
+        self.assertEqual(len(list(out.glob("run_A01_Green_Z*.png"))), N_Z)
+
     def test_contact_sheet_uses_one_fused_panel(self):
-        out = self._run("pdf_sheet_pages")
+        out = self._run(StitchOutputs(ome=False, merged_png=False, pdf="sheet_pages"))
         self.assertEqual(len(PdfReader(str(out / "run_plate_and_wells.pdf")).pages), 2)
+
+
+class ReduceWorkerTests(_WorkerCase):
+    def test_all_outputs_in_focus_mode(self):
+        out = self._run(StitchOutputs(ome=True, split_tiff=True, merged_png=True,
+                                      split_png=True, pdf="pages"), z_mode="focus")
+        sharp = _sharp_scene(20260911)
+        with tifffile.TiffFile(str(out / "run_A01.ome.tif")) as tf:
+            self.assertTrue(tf.is_ome)
+            self.assertEqual(tf.series[0].axes, "CYX")
+            self.assertIn("Brightfield", tf.ome_metadata)
+        bf = tifffile.imread(str(out / "run_A01_Brightfield.tif"))
+        self.assertEqual(bf.shape, sharp.shape)
+        self.assertLess(_mae(bf, sharp), 4.0)
+        with Image.open(out / "run_A01.png") as im:
+            self.assertEqual(im.mode, "RGB")
+        with Image.open(out / "run_A01_Green.png") as gray:
+            self.assertEqual(gray.mode, "L")
+            self.assertGreater(_corr(np.asarray(gray), 255 - sharp.astype(np.int16)), 0.98)
+        self.assertEqual(len(PdfReader(str(out / "run_A01.pdf")).pages), 1)
+
+    def test_separated_only_and_merged_only(self):
+        sep = self._run(StitchOutputs(ome=False, merged_png=False, split_png=True),
+                        z_mode="max", tag="_sep")
+        self.assertEqual(sorted(p.name for p in sep.glob("*.png")),
+                         ["run_A01_Brightfield.png", "run_A01_Green.png"])
+        merged = self._run(StitchOutputs(ome=False, merged_png=True), z_mode="max", tag="_merged")
+        self.assertEqual([p.name for p in merged.glob("*.png")], ["run_A01.png"])
+
+
+class PdfWriterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _qt_app()
+
+    def test_push_writer_and_wrapper(self):
+        with tempfile.TemporaryDirectory(prefix="bz-pdf-") as temp:
+            path = Path(temp) / "pages.pdf"
+            w = main._PdfPageWriter(path, 150, "t")
+            for i in range(3):
+                w.add(Image.new("RGB", (120, 90), (i * 60, 80, 120)))
+            w.close()
+            self.assertEqual(len(PdfReader(str(path)).pages), 3)
+
+            path2 = Path(temp) / "wrapped.pdf"
+            main.MainWindow._write_pdf_pages(
+                path2, (Image.new("RGB", (80, 60)) for _ in range(2)), 150, "t")
+            self.assertEqual(len(PdfReader(str(path2)).pages), 2)
+
+    def test_no_pages_leaves_no_file(self):
+        with tempfile.TemporaryDirectory(prefix="bz-pdf-") as temp:
+            path = Path(temp) / "empty.pdf"
+            with self.assertRaises(OSError):
+                main._PdfPageWriter(path, 150, "t").close()
+            self.assertEqual(list(Path(temp).iterdir()), [])
+            with self.assertRaises(OSError):
+                main.MainWindow._write_pdf_pages(path, iter(()), 150, "t")
+            self.assertEqual(list(Path(temp).iterdir()), [])
 
 
 class DialogAndButtonTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
-        cls.app.setOrganizationName("BZStudioZStackTests")
-        cls.app.setApplicationName("BZ Studio z-stack tests")
-        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
-        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
-                          _SETTINGS_HOME.name)
+        cls.app = _qt_app()
 
     def setUp(self):
         settings = QSettings()
@@ -276,7 +366,7 @@ class DialogAndButtonTests(unittest.TestCase):
         settings.setValue("check_updates", "0")
         settings.sync()
 
-    def test_dialog_maps_choices_to_modes(self):
+    def test_dialog_maps_choices_to_modes_and_outputs(self):
         with tempfile.TemporaryDirectory(prefix="bz-zstack-dlg-") as temp:
             capture = Path(temp) / "Capture"
             _make_z_capture(capture)
@@ -297,15 +387,43 @@ class DialogAndButtonTests(unittest.TestCase):
             self.assertIn("3 / 5", dlg.lbl_step.text())
             dlg.cmb_z.setCurrentIndex(0)
             self.assertEqual(dlg.z_step, 1)      # the step only applies to stack output
+
+            ok = dlg.box.button(main.QDialogButtonBox.StandardButton.Ok)
+            o = dlg.outputs                       # defaults: OME-TIFF + merged PNG
+            self.assertEqual((o.ome, o.split_tiff, o.merged_png, o.split_png, o.pdf),
+                             (True, False, True, False, "none"))
+            self.assertTrue(ok.isEnabled())
+            dlg.chk_ome.setChecked(False)
+            dlg.chk_merged_png.setChecked(False)
+            self.assertFalse(ok.isEnabled())      # nothing to write → cannot run
+            dlg.chk_split_png.setChecked(True)
+            self.assertTrue(ok.isEnabled())
+            dlg.cmb_pdf.setCurrentIndex(3)
+            self.assertEqual(dlg.outputs.pdf, "sheet_pages")
+            self.assertTrue(dlg.outputs.wants_sheet)
             dlg.deleteLater()
 
-    def test_sample_and_planned_names_follow_stack_mode(self):
-        self.assertEqual(main.StitchWorker.sample_name("png", True), "{base}_A01_Z001.png")
-        self.assertEqual(main.StitchWorker.sample_name("png", False), "{base}_A01.png")
-        self.assertEqual(main.StitchWorker.sample_name("both", True), "{base}_A01.ome.tif")
-        names = [p.name for p in main.StitchWorker.planned_outputs(
-            Path("/x"), "b", ["A01"], "png", {"A01": [0, 2]})]
-        self.assertEqual(names, ["b_A01_Z000.png", "b_A01_Z002.png", "b_stitch_qc.csv"])
+    def test_sample_and_planned_names_follow_the_outputs(self):
+        self.assertEqual(main.StitchWorker.sample_name(StitchOutputs(), True), "{base}_A01.ome.tif")
+        self.assertEqual(main.StitchWorker.sample_name(
+            StitchOutputs(ome=False, merged_png=True), True), "{base}_A01_Z001.png")
+        self.assertEqual(main.StitchWorker.sample_name(
+            StitchOutputs(ome=False, merged_png=False, split_png=True), False), "{base}_A01_CH1.png")
+        self.assertEqual(main.StitchWorker.sample_name(
+            StitchOutputs(ome=False, merged_png=False, pdf="sheet"), False), "{base}_plate.pdf")
+        with tempfile.TemporaryDirectory(prefix="bz-zstack-names-") as temp:
+            capture = Path(temp) / "Capture"
+            _make_z_capture(capture)
+            wells = stitcher.discover_wells(capture)
+            names = [p.name for p in main.StitchWorker.planned_outputs(
+                Path("/x"), "b", wells,
+                StitchOutputs(ome=False, merged_png=True, split_png=True, pdf="pages"),
+                {"A01": [0, 2]})]
+            self.assertEqual(sorted(names), sorted([
+                "b_A01_Z000.png", "b_A01_Z002.png",
+                "b_A01_Brightfield_Z000.png", "b_A01_Green_Z000.png",
+                "b_A01_Brightfield_Z002.png", "b_A01_Green_Z002.png",
+                "b_A01.pdf", "b_stitch_qc.csv"]))
 
     def test_stitch_button_pulses_only_while_actionable(self):
         window = main.MainWindow()
