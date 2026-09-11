@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTreeWidget, QTreeWidgetItem, QLabel, QScrollArea,
     QSlider, QGroupBox, QCheckBox, QPushButton, QToolButton,
     QFileDialog, QGridLayout, QSizePolicy, QTextEdit,
-    QProgressBar, QColorDialog, QToolBar, QInputDialog, QLineEdit,
+    QProgressBar, QColorDialog, QToolBar, QInputDialog, QLineEdit, QSpinBox,
     QTabWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, QMessageBox, QMenu,
     QProxyStyle, QStyle, QDialogButtonBox, QDialog, QComboBox, QDockWidget,
     QHeaderView,
@@ -1276,9 +1276,17 @@ class MainWindow(QMainWindow):
                       "出力は OME-TIFF（Fiji / QuPath / napari で開けます）と PNG。")
         hint.setWordWrap(True); hint.setStyleSheet("color:#6b7280; font-size:11px;")
         rp.addWidget(hint)
-        self.btn_stitch_raw = QPushButton("プレートを貼り合わせて書き出す…")
+        self.btn_stitch_raw = QPushButton("▶  プレートを貼り合わせて書き出す…")
+        self.btn_stitch_raw.setObjectName("stitchRawButton")
+        self.btn_stitch_raw.setMinimumHeight(40)
+        self.btn_stitch_raw.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stitch_raw.clicked.connect(self._stitch_raw_tiles)
         rp.addWidget(self.btn_stitch_raw)
+        # The one button that produces output was easy to miss: it pulses while a
+        # plate is loaded and idle, and stops the moment work starts.
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(650)
+        self._pulse_timer.timeout.connect(self._toggle_stitch_pulse)
         rp.addStretch()
         self.raw_panel.setMaximumHeight(200)
         self.raw_panel.setVisible(False)
@@ -1477,6 +1485,13 @@ class MainWindow(QMainWindow):
             QPushButton#primaryExportButton:hover { background:#0f67b4; border-color:#0b599d; }
             QPushButton#primaryExportButton:disabled { background:#d9e0e7; color:#8a929b;
                                                        border-color:#cbd2d9; }
+            QPushButton#stitchRawButton { background:#e8590c; border:2px solid #c94d0a;
+                                          color:white; font-weight:bold; font-size:13px;
+                                          padding:9px 14px; }
+            QPushButton#stitchRawButton:hover { background:#f2691c; border-color:#ffb27a; }
+            QPushButton#stitchRawButton[pulse="on"] { background:#ff8c42; border-color:#ffd2b3; }
+            QPushButton#stitchRawButton:disabled { background:#d9e0e7; color:#8a929b;
+                                                   border-color:#cbd2d9; }
             QGroupBox#quickExportGroup QPushButton { padding:4px 8px; }
             QToolButton { background:#ffffff; border:1px solid #c2c7ce; border-radius:3px;
                           color:#1c1e21; }
@@ -1693,6 +1708,7 @@ class MainWindow(QMainWindow):
             self.well_tabs.addTab(self.cond_tab, "Conditions")
         if hasattr(self, "raw_panel"):
             self.raw_panel.setVisible(raw)
+            self._set_stitch_pulse(raw)
         if hasattr(self, "ktf_bottom"):
             self.ktf_bottom.setVisible(not raw and not wide)
         if hasattr(self, "mosaic_workspace"):
@@ -1907,6 +1923,7 @@ class MainWindow(QMainWindow):
             return
         if not self._raw_experiment:
             self.raw_summary.setText("")
+            self._set_stitch_pulse(False)
             return
         wells = self._raw_experiment["wells"]
         lines = [f"<b>{self._raw_experiment['name']}</b> — {len(wells)} ウェル"]
@@ -1918,6 +1935,33 @@ class MainWindow(QMainWindow):
         else:
             lines.append("ウェル未選択（全ウェルを処理できます）")
         self.raw_summary.setText("<br>".join(lines))
+        self._set_stitch_pulse(True)
+
+    # ---------- stitch button pulse ----------
+    def _set_stitch_pulse(self, on: bool):
+        """Blink the stitch button only while it is the next thing to click."""
+        if not hasattr(self, "_pulse_timer"):
+            return
+        on = bool(on and self._mode == StartModeDialog.RAW and self._raw_experiment
+                  and self.btn_stitch_raw.isEnabled())
+        if on:
+            if not self._pulse_timer.isActive():
+                self._pulse_timer.start()
+        else:
+            self._pulse_timer.stop()
+            self._apply_pulse("off")
+
+    def _toggle_stitch_pulse(self):
+        self._apply_pulse("off" if self.btn_stitch_raw.property("pulse") == "on" else "on")
+
+    def _apply_pulse(self, state: str):
+        b = self.btn_stitch_raw
+        if b.property("pulse") == state:
+            return
+        b.setProperty("pulse", state)
+        b.style().unpolish(b)          # dynamic property → stylesheet re-evaluation
+        b.style().polish(b)
+        b.update()
 
     def _dispatch_well_clicked(self, well_id: str):
         if self._mode == StartModeDialog.RAW:
@@ -2826,21 +2870,25 @@ class MainWindow(QMainWindow):
         default_base = self._raw_experiment["name"]
         if not dlg.all_wells:
             default_base = f"{default_base}_{next(iter(wells))}"
+        stack = dlg.z_mode == "stack"
+        stack_z = ({w: list(wt.z_values[::dlg.z_step]) for w, wt in wells.items()}
+                   if stack else None)
         tgt = OutputTargetDialog(
             self, "貼り合わせた画像を名前を付けて保存", default_base,
-            StitchWorker.SAMPLE_NAME.get(dlg.fmt, "{base}_A01.tif"),
-            self._last_export_dir())
+            StitchWorker.sample_name(dlg.fmt, stack), self._last_export_dir())
         tgt.setStyleSheet("")
         if not tgt.exec():
             return
         out, base = tgt.folder, tgt.base
         self._remember_export_dir(tgt.root)
         if not _confirm_overwrite(
-                self, StitchWorker.planned_outputs(out, base, sorted(wells), dlg.fmt)):
+                self, StitchWorker.planned_outputs(out, base, sorted(wells), dlg.fmt,
+                                                   stack_z)):
             return
 
         self._set_actions_enabled(False)
         self.btn_stitch_raw.setEnabled(False)
+        self._set_stitch_pulse(False)
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
@@ -2851,7 +2899,7 @@ class MainWindow(QMainWindow):
             wells, out, dlg.z_mode, dlg.fmt,
             flatfield=dlg.flatfield, subpixel=dlg.subpixel,
             exp_name=self._raw_experiment["name"], base=base,
-            conditions=cond, cond_headers=headers)
+            conditions=cond, cond_headers=headers, z_step=dlg.z_step)
         self._stitch_worker.progress.connect(self._on_stitch_progress)
         self._stitch_worker.done.connect(self._on_stitch_done)
         self._stitch_worker.start()
@@ -2868,6 +2916,7 @@ class MainWindow(QMainWindow):
         self._set_actions_enabled(True)
         if hasattr(self, "btn_stitch_raw"):
             self.btn_stitch_raw.setEnabled(True)
+            self._set_stitch_pulse(True)
         warn = getattr(self._stitch_worker, "warnings", []) or []
         msg = f"Stitched {ok} well(s) into {out_dir}"
         if failed:
@@ -4788,13 +4837,34 @@ class StitchDialog(QDialog):
             self.cmb_wells.addItem(f"Selected well only ({current_well})")
         form.addWidget(self.cmb_wells, r, 1); r += 1
 
+        self.n_z = n_z
         if n_z > 1:
             form.addWidget(QLabel("Z slices:"), r, 0)
             self.cmb_z = QComboBox()
-            self.cmb_z.addItems(["Maximum projection", "Average projection", "Middle slice"])
+            self.cmb_z.addItems([
+                "最大値投影（Maximum projection）",
+                "平均投影（Average projection）",
+                "中央スライス（Middle slice）",
+                "全焦点合成（フルフォーカス）",
+                "Zスタックのまま書き出す（全スライス／間引き）",
+            ])
             form.addWidget(self.cmb_z, r, 1); r += 1
+            form.addWidget(QLabel("間引き:"), r, 0)
+            step_row = QHBoxLayout()
+            self.spin_step = QSpinBox()
+            self.spin_step.setRange(1, n_z)
+            self.spin_step.setValue(1)
+            self.spin_step.setSuffix(" 枚ごとに 1 枚")
+            self.spin_step.setToolTip("1 = すべてのスライス、2 = 1 枚飛ばし、3 = 2 枚飛ばし …")
+            self.lbl_step = QLabel()
+            step_row.addWidget(self.spin_step)
+            step_row.addWidget(self.lbl_step, stretch=1)
+            form.addLayout(step_row, r, 1); r += 1
+            self.cmb_z.currentIndexChanged.connect(self._refresh_z)
+            self.spin_step.valueChanged.connect(self._refresh_z)
         else:
             self.cmb_z = None
+            self.spin_step = None
 
         form.addWidget(QLabel("Output:"), r, 0)
         self.cmb_fmt = QComboBox()
@@ -4827,6 +4897,11 @@ class StitchDialog(QDialog):
         note.setWordWrap(True)
         note.setStyleSheet("color:#6b7280; font-size:11px;")
         lay.addWidget(note)
+        self.z_note = QLabel(self.STACK_NOTE)
+        self.z_note.setWordWrap(True)
+        self.z_note.setStyleSheet("color:#8a4b08; font-size:11px;")
+        self.z_note.setVisible(False)
+        lay.addWidget(self.z_note)
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                QDialogButtonBox.StandardButton.Cancel)
@@ -4834,6 +4909,22 @@ class StitchDialog(QDialog):
         box.accepted.connect(self.accept)
         box.rejected.connect(self.reject)
         lay.addWidget(box)
+        self._refresh_z()
+
+    #: what each output format does with a Z stack — shown only in stack mode
+    STACK_NOTE = ("Zスタック出力: OME-TIFF は Z 軸付きの 1 ファイル、チャンネル別 TIFF は"
+                  "多ページ、PNG と「PDF (1 well per page)」はスライスごとに書き出します。"
+                  "コンタクトシートと OME-TIFF の PNG プレビューは全焦点合成の 1 枚です。")
+
+    def _refresh_z(self):
+        if self.cmb_z is None:
+            return
+        stack = self.cmb_z.currentIndex() == 4
+        self.spin_step.setEnabled(stack)
+        self.lbl_step.setEnabled(stack)
+        kept = len(range(0, self.n_z, self.spin_step.value()))
+        self.lbl_step.setText(f"→ {kept} / {self.n_z} 枚を書き出し" if stack else "")
+        self.z_note.setVisible(stack)
 
     @property
     def all_wells(self):
@@ -4843,7 +4934,14 @@ class StitchDialog(QDialog):
     def z_mode(self):
         if self.cmb_z is None:
             return "max"
-        return ["max", "mean", "middle"][self.cmb_z.currentIndex()]
+        return ["max", "mean", "middle", "focus", "stack"][self.cmb_z.currentIndex()]
+
+    @property
+    def z_step(self):
+        """Keep every Nth slice; only meaningful when the stack itself is written."""
+        if self.spin_step is None or self.z_mode != "stack":
+            return 1
+        return self.spin_step.value()
 
     @property
     def fmt(self):
@@ -4877,18 +4975,28 @@ class StitchWorker(QThread):
         "ometiff_pdf": "{base}_A01.ome.tif",
     }
 
+    @classmethod
+    def sample_name(cls, fmt: str, stack: bool = False) -> str:
+        """Example filename for the Save-As preview."""
+        if stack and fmt == "png":
+            return "{base}_A01_Z001.png"
+        return cls.SAMPLE_NAME.get(fmt, "{base}_A01.tif")
+
     @staticmethod
-    def planned_outputs(out: Path, base: str, wids, fmt) -> list:
+    def planned_outputs(out: Path, base: str, wids, fmt, stack_z: dict = None) -> list:
         """Every file this run will write, so nothing is replaced without asking.
 
-        Kept next to `_write`, which is the only place these names are produced —
-        the two must agree or the warning silently misses files.
+        Kept next to `_write` / `_write_stack`, the only places these names are
+        produced — they must agree or the warning silently misses files.
+        `stack_z` maps well → kept Z values when slices are written one by one.
         """
         out, paths = Path(out), []
         for wid in wids:
             if fmt in ("ometiff", "both", "ometiff_pdf"):
                 paths.append(out / f"{base}_{wid}.ome.tif")
-            if fmt in ("png", "both"):
+            if fmt == "png" and stack_z is not None:
+                paths += [out / f"{base}_{wid}_Z{z:03d}.png" for z in stack_z.get(wid, [])]
+            elif fmt in ("png", "both"):
                 paths.append(out / f"{base}_{wid}.png")
             if fmt == "pdf_pages":
                 paths.append(out / f"{base}_{wid}.pdf")
@@ -4906,7 +5014,8 @@ class StitchWorker(QThread):
         return paths
 
     def __init__(self, wells, out_dir, z_mode, fmt, flatfield=True, subpixel=True,
-                 exp_name="experiment", base="", conditions=None, cond_headers=None):
+                 exp_name="experiment", base="", conditions=None, cond_headers=None,
+                 z_step=1):
         super().__init__()
         self.exp_name = exp_name
         self.base = _safe_base_name(base) or _safe_base_name(exp_name) or "stitched"
@@ -4917,6 +5026,7 @@ class StitchWorker(QThread):
         self.wells = wells
         self.out_dir = Path(out_dir)
         self.z_mode = z_mode
+        self.z_step = max(1, int(z_step))
         self.fmt = fmt
         self.flatfield = flatfield
         self.subpixel = subpixel
@@ -4960,11 +5070,7 @@ class StitchWorker(QThread):
                     self.progress.emit("", _b + frac / total)
 
             try:
-                res = stitcher.stitch_well(
-                    wt, z_mode=self.z_mode, progress=cb,
-                    cancel=lambda: self._cancel,
-                    flatfield=self.flatfield, subpixel=self.subpixel, prior=prior)
-                geo = res.pop("__geometry__", {}) or {}
+                geo, res = self._stitch(wt, cb, prior)
                 if not res:
                     failed += 1
                     continue
@@ -4975,8 +5081,7 @@ class StitchWorker(QThread):
                     # retry later, once some other well has produced a geometry
                     deferred.append((wid, wt))
                     continue
-                self._record_warnings(wid, geo)
-                self._write(wid, wt, res)
+                self._emit(wid, wt, geo, res)
                 ok += 1
             except Exception as e:
                 print(f"Stitch error {wid}: {e}")
@@ -4988,16 +5093,12 @@ class StitchWorker(QThread):
                 break
             self.progress.emit(f"{wid}: retrying with plate geometry…", -1.0)
             try:
-                res = stitcher.stitch_well(
-                    wt, z_mode=self.z_mode, cancel=lambda: self._cancel,
-                    flatfield=self.flatfield, subpixel=self.subpixel, prior=prior)
-                geo = res.pop("__geometry__", {}) or {}
+                geo, res = self._stitch(wt, None, prior)
                 if not res:
                     failed += 1
                     continue
                 self.qc.append(geo)
-                self._record_warnings(wid, geo)
-                self._write(wid, wt, res)
+                self._emit(wid, wt, geo, res)
                 ok += 1
             except Exception as e:
                 print(f"Stitch error {wid}: {e}")
@@ -5014,6 +5115,25 @@ class StitchWorker(QThread):
                 self.warnings.append(f"コンタクトシート PDF: {_friendly_error(e)}")
         self._write_qc()
         self.done.emit(ok, failed, str(self.out_dir))
+
+    def _stitch(self, wt, cb, prior):
+        """Measure one well. In stack mode the mosaics are produced lazily."""
+        kw = dict(progress=cb, cancel=lambda: self._cancel,
+                  flatfield=self.flatfield, subpixel=self.subpixel, prior=prior)
+        if self.z_mode == "stack":
+            res = stitcher.stitch_well_stack(wt, z_step=self.z_step, **kw)
+            geo = res.pop("__geometry__", {}) or {}
+            return geo, (res if res.get("planes") else {})
+        res = stitcher.stitch_well(wt, z_mode=self.z_mode, **kw)
+        return (res.pop("__geometry__", {}) or {}), res
+
+    def _emit(self, wid, wt, geo, res):
+        if self.z_mode == "stack":
+            self._write_stack(wid, wt, res)
+            self._record_warnings(wid, geo)     # after: unreadable slices are known now
+        else:
+            self._record_warnings(wid, geo)
+            self._write(wid, wt, res)
 
     def _record_warnings(self, wid, geo):
         src = geo.get("step_source", {}) or {}
@@ -5078,13 +5198,20 @@ class StitchWorker(QThread):
             print(f"QC write failed: {e}")
 
     @staticmethod
-    def _composite(planes_data):
-        """Display-stretched RGB composite of a stitched well."""
+    def _composite(planes_data, levels=None):
+        """Display-stretched RGB composite of a stitched well.
+
+        `levels` fixes the stretch per plane so every slice of a stack is shown
+        with the same contrast instead of each slice auto-stretching itself.
+        """
         views, images = [], {}
         for p, img in planes_data:
-            nz = img[img > 0]
-            lo = int(np.percentile(nz, 1)) if nz.size else 0
-            hi = max(int(np.percentile(nz, 99.5)) if nz.size else 255, lo + 1)
+            if levels and p.key in levels:
+                lo, hi = levels[p.key]
+            else:
+                nz = img[img > 0]
+                lo = int(np.percentile(nz, 1)) if nz.size else 0
+                hi = max(int(np.percentile(nz, 99.5)) if nz.size else 255, lo + 1)
             color = p.color or CHANNEL_COLORS.get(p.channel, (200, 200, 200))
             views.append(render.ChannelView(p.key, color, lo=lo, hi=hi))
             images[p.key] = img
@@ -5115,6 +5242,95 @@ class StitchWorker(QThread):
             im.thumbnail((self.SHEET_PANEL, self.SHEET_PANEL), Image.Resampling.LANCZOS)
             self.sheet_panels[wid] = im
 
+    def _write_stack(self, wid, wt, res):
+        """Stream every kept Z slice to disk; one mosaic is alive at a time.
+
+        Names must stay in step with planned_outputs(). The OME-TIFF and the
+        per-well PDF writers are pull-based, so whichever one the format needs
+        drives the page stream, and everything else — per-slice PNGs, per-channel
+        TIFF pages, the all-in-focus preview — happens as the pages go by.
+        """
+        planes, zs, levels = res["planes"], res["z_values"], res["levels"]
+        shape, fmt = res["shape"], self.fmt
+        pixel_um = stitcher.tile_pixel_um(wt)
+        want_composite = fmt not in ("ometiff", "split")
+        fusion = (stitcher.FocusFusion()
+                  if fmt in ("both", "pdf_sheet", "pdf_sheet_pages", "ometiff_pdf")
+                  else None)
+
+        split_writers = {}
+        if fmt == "split":
+            import tifffile
+            for p in planes:
+                tmp = self.out_dir / f"{self.base}_{wid}_{p.label}.tif.part"
+                big = len(zs) * shape[0] * shape[1] * np.dtype(res["dtypes"][p.key]).itemsize
+                split_writers[p.key] = (tmp, tifffile.TiffWriter(str(tmp), bigtiff=big > 2 ** 31))
+
+        current = {}                    # plane.key → mosaic of the z being assembled
+
+        def on_page(plane, z, mosaic):
+            """Fan one page out to the push-based consumers; returns the z's composite."""
+            if plane.key in split_writers:
+                split_writers[plane.key][1].write(mosaic, contiguous=True,
+                                                  photometric="minisblack")
+            if not want_composite:
+                return None
+            current[plane.key] = mosaic
+            if len(current) < len(planes):
+                return None
+            comp = self._composite([(p, current[p.key]) for p in planes], levels)
+            current.clear()
+            if fmt == "png":
+                comp.save(self.out_dir / f"{self.base}_{wid}_Z{z:03d}.png")
+            if fusion is not None:
+                fusion.add(np.asarray(comp))
+            return comp
+
+        def stream():
+            for plane, z, mosaic in res["pages"]:
+                on_page(plane, z, mosaic)
+                yield mosaic
+
+        def composites():
+            for plane, z, mosaic in res["pages"]:
+                comp = on_page(plane, z, mosaic)
+                if comp is not None:
+                    yield comp
+
+        try:
+            if fmt in ("ometiff", "both", "ometiff_pdf"):
+                dtype = np.result_type(*[res["dtypes"][p.key] for p in planes])
+                stitcher.save_ome_tiff_stack(
+                    self.out_dir / f"{self.base}_{wid}.ome.tif", planes, len(zs),
+                    stream(), dtype, shape, pixel_um)
+            elif fmt == "pdf_pages":
+                pages = (self._page_for(comp, wid, f"Z {i + 1}/{len(zs)}")
+                         for i, comp in enumerate(composites()))
+                MainWindow._write_pdf_pages(self.out_dir / f"{self.base}_{wid}.pdf",
+                                            pages, 300, f"{self.exp_name} {wid}")
+            else:
+                for _ in composites():  # nothing pulls, so drive the stream here
+                    pass
+        except BaseException:
+            for tmp, writer in split_writers.values():
+                writer.close()
+                tmp.unlink(missing_ok=True)
+            raise
+        for tmp, writer in split_writers.values():
+            writer.close()
+            tmp.replace(tmp.with_suffix(""))         # drop ".part"
+
+        if fusion is None or fusion.result() is None:
+            return
+        fused = Image.fromarray(fusion.result())
+        if fmt == "both":
+            fused.save(self.out_dir / f"{self.base}_{wid}.png")
+        if fmt == "pdf_sheet_pages":
+            self.well_pages.append((wid, self._page_for(fused, wid, "全焦点合成")))
+        if fmt in ("pdf_sheet", "pdf_sheet_pages", "ometiff_pdf"):
+            fused.thumbnail((self.SHEET_PANEL, self.SHEET_PANEL), Image.Resampling.LANCZOS)
+            self.sheet_panels[wid] = fused
+
     #: long edge of each well panel on the contact sheet
     SHEET_PANEL = 1100
 
@@ -5125,14 +5341,15 @@ class StitchWorker(QThread):
         page.save(tmp, "PDF", resolution=300.0, quality=95, subsampling=0)
         tmp.replace(path)
 
-    def _page_for(self, im, wid):
+    def _page_for(self, im, wid, subtitle=""):
         """A single well rendered as a labelled page."""
         band = max(48, im.height // 24)
         page = Image.new("RGB", (im.width, im.height + band), (255, 255, 255))
         page.paste(im.convert("RGB"), (0, band))
         d = ImageDraw.Draw(page)
         f_hdr = _load_font_static(max(20, band // 2))
-        d.text((10, band // 5), f"{self.exp_name}   {wid}   ({im.width}×{im.height})",
+        head = f"{self.exp_name}   {wid}" + (f"   {subtitle}" if subtitle else "")
+        d.text((10, band // 5), f"{head}   ({im.width}×{im.height})",
                fill=(0, 0, 0), font=f_hdr)
         lines = self.conditions_for(wid)
         if lines:

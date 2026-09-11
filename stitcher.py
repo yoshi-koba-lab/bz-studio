@@ -607,9 +607,74 @@ def blend(images: dict, origins: dict, tile_shape, out_shape,
 
 # ---------------------------------------------------------------- stitching
 
+# ---------------------------------------------------------------- focus fusion
+
+#: half-width of the window over which sharpness is judged (an 11 px square)
+FOCUS_WINDOW = 5
+
+
+def _focus_measure(img: np.ndarray, k: int = FOCUS_WINDOW) -> np.ndarray:
+    """Local high-frequency energy — large where this slice is sharp.
+
+    Sign-free, so dark-on-bright brightfield and bright-on-dark fluorescence are
+    judged alike; the window keeps the choice spatially coherent instead of
+    flickering between slices pixel by pixel.
+    """
+    a = np.asarray(img, dtype=np.float32)
+    if a.ndim == 3:                        # RGB composite: judge on the brightest channel
+        a = a.max(axis=2)
+    lap = np.zeros_like(a)
+    lap[1:-1, 1:-1] = (-4.0 * a[1:-1, 1:-1] + a[:-2, 1:-1] + a[2:, 1:-1]
+                       + a[1:-1, :-2] + a[1:-1, 2:])
+    return _box(lap * lap, k)
+
+
+class FocusFusion:
+    """All-in-focus image assembled one slice at a time.
+
+    Only the running best-sharpness map and the output are kept, so a 30-slice
+    mosaic can be fused while it streams to disk instead of sitting in memory.
+    """
+
+    def __init__(self, k: int = FOCUS_WINDOW):
+        self.k = k
+        self.best = None
+        self.out = None
+        self.index = None
+        self.n = 0
+
+    def add(self, img: np.ndarray):
+        score = _focus_measure(img, self.k)
+        if self.best is None:
+            self.best = score
+            self.out = np.array(img, copy=True)
+            self.index = np.zeros(score.shape, np.int16)
+        else:
+            better = score > self.best
+            self.best[better] = score[better]
+            self.out[better] = img[better]
+            self.index[better] = self.n
+        self.n += 1
+
+    def result(self) -> np.ndarray:
+        return self.out
+
+
+def focus_stack(stack: list) -> np.ndarray:
+    """Per-pixel sharpest slice — the "full focus" image of a Z stack."""
+    if len(stack) == 1:
+        return stack[0]
+    fusion = FocusFusion()
+    for s in stack:
+        fusion.add(s)
+    return fusion.result()
+
+
 def _z_reduce(stack: list, mode: str) -> np.ndarray:
     if len(stack) == 1:
         return stack[0]
+    if mode == "focus":
+        return focus_stack(stack)
     arr = np.stack(stack)
     if mode == "max":
         return arr.max(axis=0)
@@ -618,6 +683,20 @@ def _z_reduce(stack: list, mode: str) -> np.ndarray:
         # (uint16 1000,1001 -> 1000 -> 5000 instead of 5002).
         return arr.mean(axis=0, dtype=np.float32)
     return arr[len(arr) // 2]          # "middle"
+
+
+def _display_levels(images) -> tuple:
+    """(lo, hi) display stretch: 1st–99.5th percentile of the non-zero pixels.
+
+    Computed once per plane so every slice of a stack is shown with the same
+    contrast — a per-slice stretch would make the preview flicker with depth.
+    """
+    sample = np.concatenate([np.asarray(im)[::8, ::8].ravel() for im in images])
+    sample = sample[sample > 0]
+    if sample.size == 0:
+        return 0, 255
+    lo = int(np.percentile(sample, 1))
+    return lo, max(int(np.percentile(sample, 99.5)), lo + 1)
 
 
 def reference_plane(wt: WellTiles) -> Plane:
@@ -722,11 +801,20 @@ def stitch_well(wt: WellTiles, planes=None, z_mode: str = "max",
                                           out_dtype=pdtype))
         if progress:
             progress(None, 0.15 + 0.85 * (pi + 1) / max(1, len(planes)))
-    result["__geometry__"] = {
+    result["__geometry__"] = _geometry_report(
+        wt, step_x, step_y, px, py, src, out_shape, len(ref_imgs), bad, fields,
+        prior, edges)
+    return result
+
+
+def _geometry_report(wt, step_x, step_y, px, py, src, out_shape, n_tiles, bad,
+                     fields, prior, edges) -> dict:
+    """The per-well QC record that ends up in stitch_qc.csv."""
+    return {
         "well": wt.well,
         "step_x": step_x, "step_y": step_y, "peak_x": px, "peak_y": py,
         "step_source": src,
-        "shape": out_shape, "tiles": len(ref_imgs),
+        "shape": out_shape, "tiles": n_tiles,
         "overlap_x": wt.tile_shape[1] - abs(step_x[1]),
         "overlap_y": wt.tile_shape[0] - abs(step_y[0]),
         "unreadable": bad,
@@ -748,7 +836,119 @@ def stitch_well(wt: WellTiles, planes=None, z_mode: str = "max",
                            or src["x"] != "measured" or src["y"] != "measured"),
         **edges,
     }
-    return result
+
+
+def stitch_well_stack(wt: WellTiles, z_step: int = 1, planes=None, progress=None,
+                      cancel=None, flatfield: bool = True, prior: dict = None,
+                      subpixel: bool = True) -> dict:
+    """Stitch every kept Z slice on ONE geometry, producing one mosaic at a time.
+
+    Returns the geometry, the planes and Z values that will be produced, a fixed
+    display stretch per plane, and ``pages`` — a generator of (plane, z, mosaic)
+    in Z-outer / channel-inner order. A 30-slice, 3-channel well is several GB
+    as one array; streaming keeps a single mosaic (plus the blend accumulators)
+    alive at a time.
+
+    Geometry, flat-field and display levels are all taken from the focus-fused
+    tiles of the kept slices: every slice then lands on the same grid, and every
+    slice's preview uses the same contrast.
+    """
+    planes = planes or wt.planes
+    ref = reference_plane(wt)
+    zs = list(wt.z_values[::max(1, int(z_step))]) or list(wt.z_values)
+    bad = []
+
+    def load_fused(plane, pos):
+        x, y = pos
+        stack = []
+        for z in zs:
+            f = wt.files.get((x, y, z, plane.channel))
+            if f is None:
+                continue
+            try:
+                stack.append(_read_plane(f, plane.page))
+            except Exception as e:     # skip the slice, keep the well
+                bad.append((f.name, str(e)))
+        if not stack:
+            return None
+        if len({s.shape for s in stack}) > 1:      # ragged Z stack — common size
+            h = min(s.shape[0] for s in stack)
+            w = min(s.shape[1] for s in stack)
+            stack = [s[:h, :w] for s in stack]
+        return focus_stack(stack)
+
+    fused, fields, levels, dtypes = {}, {}, {}, {}
+    for pi, plane in enumerate(planes):
+        if cancel and cancel():
+            return {}
+        if progress:
+            progress(f"{wt.well}: {plane.label} の全焦点合成…", None)
+        imgs = {}
+        for pos in wt.positions:
+            img = load_fused(plane, pos)
+            if img is not None:
+                imgs[pos] = img
+        if not imgs:
+            continue
+        dtypes[plane.key] = next(iter(imgs.values())).dtype
+        if flatfield and len(imgs) >= 4:
+            # estimate per channel: each has its own illumination path
+            fields[plane.key] = estimate_flatfield(list(imgs.values()))
+            imgs = {k: apply_flatfield(v, fields[plane.key]) for k, v in imgs.items()}
+        fused[plane.key] = imgs
+        levels[plane.key] = _display_levels(imgs.values())
+        if progress:
+            progress(None, 0.2 * (pi + 1) / max(1, len(planes)))
+    if ref.key not in fused:
+        return {}
+    planes = [p for p in planes if p.key in fused]
+
+    ref_imgs = fused[ref.key]
+    step_x, step_y, px, py, src = estimate_steps(ref_imgs, prior=prior)
+    origins = tile_origins(wt.positions, step_x, step_y)
+    out_shape = mosaic_size(origins, wt.tile_shape)
+    edges = _edge_report(ref_imgs, step_x, step_y, subpixel=subpixel)
+    geometry = _geometry_report(wt, step_x, step_y, px, py, src, out_shape,
+                                len(ref_imgs), bad, fields, prior, edges)
+    geometry["z_values"] = zs
+    geometry["z_step"] = int(z_step)
+    n_tiles = len(ref_imgs)
+    del fused, ref_imgs                    # the fused tiles have done their job
+
+    def pages():
+        total = len(zs) * len(planes)
+        done = 0
+        for zi, z in enumerate(zs):
+            for plane in planes:
+                if cancel and cancel():
+                    return
+                imgs = {}
+                for pos in wt.positions:
+                    f = wt.files.get((pos[0], pos[1], z, plane.channel))
+                    if f is None:
+                        continue
+                    try:
+                        img = _read_plane(f, plane.page)
+                    except Exception as e:
+                        bad.append((f.name, str(e)))
+                        continue
+                    if plane.key in fields:
+                        img = apply_flatfield(img, fields[plane.key])
+                    imgs[pos] = img
+                dtype = dtypes[plane.key]
+                # An unreadable slice stays a blank page so the stack keeps its
+                # Z index; the QC report lists the files.
+                mosaic = (blend(imgs, origins, wt.tile_shape, out_shape, out_dtype=dtype)
+                          if imgs else np.zeros(out_shape, dtype))
+                done += 1
+                if progress:
+                    progress(f"{wt.well}: Z {zi + 1}/{len(zs)} {plane.label}…", None)
+                    progress(None, 0.2 + 0.8 * done / max(1, total))
+                yield plane, z, mosaic
+
+    return {"__geometry__": geometry, "planes": planes, "z_values": zs,
+            "levels": levels, "dtypes": dtypes, "shape": out_shape,
+            "tiles": n_tiles, "pages": pages()}
 
 
 def _edge_report(images: dict, step_x, step_y, subpixel: bool = True) -> dict:
@@ -814,7 +1014,9 @@ def save_ome_tiff(path: Path, planes_data: list, pixel_um: float = 0.0):
     last = None
     for comp in ("zlib", "lzw", None):   # zlib needs a recent imagecodecs
         try:
-            tifffile.imwrite(str(tmp), arr, photometric="minisblack",
+            # ome=True: tifffile otherwise decides by extension, and the ".part"
+            # temp name would silently produce a plain TIFF with no OME-XML.
+            tifffile.imwrite(str(tmp), arr, photometric="minisblack", ome=True,
                              compression=comp, metadata=meta, **kwargs)
             tmp.replace(path)
             return
@@ -822,3 +1024,49 @@ def save_ome_tiff(path: Path, planes_data: list, pixel_um: float = 0.0):
             last = e
             tmp.unlink(missing_ok=True)
     raise RuntimeError(f"could not write {path}: {last}")
+
+
+def _has_imagecodecs() -> bool:
+    try:
+        import imagecodecs  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def save_ome_tiff_stack(path: Path, planes: list, n_z: int, pages, dtype,
+                        shape: tuple, pixel_um: float = 0.0):
+    """Write a Z-stack OME-TIFF (axes ZCYX) from a page iterator, page by page.
+
+    ``pages`` must yield the Z × C mosaics in Z-outer, channel-inner order — what
+    ``stitch_well_stack`` produces. The iterator is consumed exactly once, so the
+    compression is decided up front instead of by retrying. Written to a
+    temporary file and renamed, so a failure never truncates a good result.
+    """
+    import tifffile
+    dtype = np.dtype(dtype)
+    # mosaic_size() hands back numpy ints; tifffile serialises the shape as JSON
+    n_z, Y, X = int(n_z), int(shape[0]), int(shape[1])
+    meta = {"axes": "ZCYX",
+            "Channel": {"Name": [p.label for p in planes]}}
+    kwargs = {}
+    if pixel_um:
+        meta["PhysicalSizeX"] = pixel_um
+        meta["PhysicalSizeY"] = pixel_um
+        meta["PhysicalSizeXUnit"] = "µm"
+        meta["PhysicalSizeYUnit"] = "µm"
+        kwargs["resolution"] = (1e4 / pixel_um, 1e4 / pixel_um)
+    nbytes = n_z * len(planes) * Y * X * dtype.itemsize
+    tmp = Path(str(path) + ".part")
+    try:
+        # ome=True: tifffile otherwise decides by extension, and the ".part" temp
+        # name would silently produce a plain TIFF with no OME-XML.
+        tifffile.imwrite(str(tmp), (np.asarray(m, dtype=dtype) for m in pages),
+                         shape=(n_z, len(planes), Y, X), dtype=dtype, ome=True,
+                         photometric="minisblack",
+                         compression="zlib" if _has_imagecodecs() else None,
+                         bigtiff=nbytes > 2 ** 31, metadata=meta, **kwargs)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.replace(path)
