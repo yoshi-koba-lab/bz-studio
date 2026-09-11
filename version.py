@@ -7,7 +7,7 @@ mirrored in the packaging metadata. Semantic versioning — MAJOR.MINOR.PATCH:
   PATCH  ordinary updates: fixes and small improvements (the usual bump)
 """
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 APP_NAME = "BZ Studio"
 # Keep the established QSettings namespace so upgrading does not hide saved
 # Conditions, recent folders, or Series Builder labels.

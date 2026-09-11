@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bz-studio"
-version = "2.1.0"
+version = "2.1.1"
 description = "Wide-area microscopy mosaic, plate-image, and KTF desktop studio"
 readme = "README.md"
 requires-python = ">=3.9"
